@@ -1,0 +1,113 @@
+name: Build Minecraft Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Unique build ID'
+        required: true
+        type: string
+      plugin_name:
+        description: 'Plugin main class name'
+        required: true
+        type: string
+      callback_url:
+        description: 'Callback URL'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Maven
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: '3.9.6'
+
+      - name: Download source from Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+        run: |
+          mkdir -p plugin-src
+          cd plugin-src
+
+          # Download source zip from Supabase Storage
+          curl -s -L \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/sources/$BUILD_ID.zip" \
+            -o source.zip
+
+          unzip -q source.zip
+          rm source.zip
+          echo "Source extracted:"
+          ls -la
+
+      - name: Build with Maven
+        id: maven
+        working-directory: ./plugin-src
+        run: |
+          mvn -B clean package -DskipTests
+
+          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
+
+          if [ -z "$JAR_FILE" ]; then
+            echo "No JAR found!"
+            exit 1
+          fi
+
+          echo "jar_path=$JAR_FILE" >> $GITHUB_OUTPUT
+          echo "Found JAR: $JAR_FILE"
+
+      - name: Upload JAR to Supabase
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+        run: |
+          JAR_FILE="./plugin-src/${{ steps.maven.outputs.jar_path }}"
+
+          curl -X POST \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/java-archive" \
+            --data-binary "@$JAR_FILE" \
+            "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/artifacts/$BUILD_ID.jar"
+
+      - name: Notify Backend - Success
+        if: success()
+        env:
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+        run: |
+          curl -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"success\",\"artifact_key\":\"artifacts/$BUILD_ID.jar\"}"
+
+      - name: Notify Backend - Failure
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+        run: |
+          curl -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\"}"
