@@ -49,7 +49,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-          cache: 'maven'
 
       - name: Download source from Supabase
         env:
@@ -116,7 +115,7 @@ jobs:
             "$UPLOAD_URL")
 
           echo "Upload status: $HTTP_CODE"
-          
+
           if [ "$HTTP_CODE" != "200" ]; then
             echo "❌ Upload failed"
             exit 1
@@ -138,16 +137,13 @@ jobs:
         env:
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           BUILD_ID: ${{ github.event.inputs.build_id }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           ERROR_MSG="Build failed - check GitHub Actions logs"
-          
-          # Try to get build log if it exists
+
           if [ -f "./plugin-src/build.log" ]; then
-            ERROR_MSG=$(tail -c 500 ./plugin-src/build.log)
+            ERROR_MSG=$(tail -c 500 ./plugin-src/build.log | tr '\n' ' ' | sed 's/"/\\"/g')
           fi
-          
+
           curl -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
             -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
