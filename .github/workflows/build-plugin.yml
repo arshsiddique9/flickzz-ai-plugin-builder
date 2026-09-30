@@ -28,16 +28,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify Secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ]; then
+            echo "❌ SUPABASE_URL secret is missing!"
+            exit 1
+          fi
+          if [ -z "$SUPABASE_SERVICE_KEY" ]; then
+            echo "❌ SUPABASE_SERVICE_KEY secret is missing!"
+            exit 1
+          fi
+          echo "✅ Secrets present"
+          echo "SUPABASE_URL prefix: ${SUPABASE_URL:0:30}..."
+
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
-
-      - name: Setup Maven
-        uses: stCarolas/setup-maven@v5
-        with:
-          maven-version: '3.9.6'
+          cache: 'maven'
 
       - name: Download source from Supabase
         env:
@@ -48,32 +60,43 @@ jobs:
           mkdir -p plugin-src
           cd plugin-src
 
-          curl -s -L \
+          DOWNLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/sources/$BUILD_ID.zip"
+          echo "Downloading from: $DOWNLOAD_URL"
+
+          HTTP_CODE=$(curl -s -L -w "%{http_code}" -o source.zip \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
-            "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/sources/$BUILD_ID.zip" \
-            -o source.zip
+            "$DOWNLOAD_URL")
+
+          echo "HTTP Status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to download source. Status: $HTTP_CODE"
+            cat source.zip
+            exit 1
+          fi
 
           unzip -q source.zip
           rm source.zip
-          echo "Source extracted:"
-          ls -la
+          echo "✅ Source extracted:"
+          find . -type f
 
       - name: Build with Maven
         id: maven
         working-directory: ./plugin-src
         run: |
-          mvn -B clean package -DskipTests
+          echo "Starting Maven build..."
+          mvn -B clean package -DskipTests 2>&1 | tee build.log
 
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
 
           if [ -z "$JAR_FILE" ]; then
-            echo "No JAR found!"
+            echo "❌ No JAR found!"
             exit 1
           fi
 
           echo "jar_path=$JAR_FILE" >> $GITHUB_OUTPUT
-          echo "Found JAR: $JAR_FILE"
+          echo "✅ Found JAR: $JAR_FILE"
 
       - name: Upload JAR to Supabase
         if: success()
@@ -83,13 +106,22 @@ jobs:
           BUILD_ID: ${{ github.event.inputs.build_id }}
         run: |
           JAR_FILE="./plugin-src/${{ steps.maven.outputs.jar_path }}"
+          UPLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/artifacts/$BUILD_ID.jar"
 
-          curl -X POST \
+          HTTP_CODE=$(curl -s -X POST -w "%{http_code}" -o /dev/null \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/java-archive" \
             --data-binary "@$JAR_FILE" \
-            "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/artifacts/$BUILD_ID.jar"
+            "$UPLOAD_URL")
+
+          echo "Upload status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Upload failed"
+            exit 1
+          fi
+          echo "✅ JAR uploaded"
 
       - name: Notify Backend - Success
         if: success()
@@ -106,7 +138,16 @@ jobs:
         env:
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           BUILD_ID: ${{ github.event.inputs.build_id }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
+          ERROR_MSG="Build failed - check GitHub Actions logs"
+          
+          # Try to get build log if it exists
+          if [ -f "./plugin-src/build.log" ]; then
+            ERROR_MSG=$(tail -c 500 ./plugin-src/build.log)
+          fi
+          
           curl -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\"}"
+            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
