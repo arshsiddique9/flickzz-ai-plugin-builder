@@ -33,16 +33,11 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          if [ -z "$SUPABASE_URL" ]; then
-            echo "❌ SUPABASE_URL secret is missing!"
-            exit 1
-          fi
-          if [ -z "$SUPABASE_SERVICE_KEY" ]; then
-            echo "❌ SUPABASE_SERVICE_KEY secret is missing!"
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
+            echo "❌ Missing Supabase secrets!"
             exit 1
           fi
           echo "✅ Secrets present"
-          echo "SUPABASE_URL prefix: ${SUPABASE_URL:0:30}..."
 
       - name: Setup Java 21
         uses: actions/setup-java@v4
@@ -58,26 +53,17 @@ jobs:
         run: |
           mkdir -p plugin-src
           cd plugin-src
-
           DOWNLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/sources/$BUILD_ID.zip"
-          echo "Downloading from: $DOWNLOAD_URL"
-
           HTTP_CODE=$(curl -s -L -w "%{http_code}" -o source.zip \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             "$DOWNLOAD_URL")
-
-          echo "HTTP Status: $HTTP_CODE"
-
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Failed to download source. Status: $HTTP_CODE"
-            cat source.zip
+            echo "❌ Source download failed (HTTP $HTTP_CODE)"
             exit 1
           fi
-
-          unzip -q source.zip
-          rm source.zip
-          echo "✅ Source extracted:"
+          unzip -q source.zip && rm source.zip
+          echo "✅ Source extracted"
           find . -type f
 
       - name: Build with Maven
@@ -85,15 +71,24 @@ jobs:
         working-directory: ./plugin-src
         run: |
           echo "Starting Maven build..."
+          set +e
           mvn -B clean package -DskipTests 2>&1 | tee build.log
+          MVN_EXIT=$?
+          set -e
+
+          if [ $MVN_EXIT -ne 0 ]; then
+            echo "❌ Maven build failed"
+            # Extract only ERROR lines for cleaner callback
+            grep -E "\[ERROR\]|error:" build.log | head -50 > errors.txt || true
+            echo "BUILD_FAILED=true" >> $GITHUB_ENV
+            exit 1
+          fi
 
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
-
           if [ -z "$JAR_FILE" ]; then
             echo "❌ No JAR found!"
             exit 1
           fi
-
           echo "jar_path=$JAR_FILE" >> $GITHUB_OUTPUT
           echo "✅ Found JAR: $JAR_FILE"
 
@@ -106,18 +101,14 @@ jobs:
         run: |
           JAR_FILE="./plugin-src/${{ steps.maven.outputs.jar_path }}"
           UPLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/artifacts/$BUILD_ID.jar"
-
           HTTP_CODE=$(curl -s -X POST -w "%{http_code}" -o /dev/null \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/java-archive" \
             --data-binary "@$JAR_FILE" \
             "$UPLOAD_URL")
-
-          echo "Upload status: $HTTP_CODE"
-
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Upload failed"
+            echo "❌ JAR upload failed (HTTP $HTTP_CODE)"
             exit 1
           fi
           echo "✅ JAR uploaded"
@@ -138,10 +129,13 @@ jobs:
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           BUILD_ID: ${{ github.event.inputs.build_id }}
         run: |
-          ERROR_MSG="Build failed - check GitHub Actions logs"
-
-          if [ -f "./plugin-src/build.log" ]; then
-            ERROR_MSG=$(tail -c 500 ./plugin-src/build.log | tr '\n' ' ' | sed 's/"/\\"/g')
+          # Extract concise error (only compile errors)
+          if [ -f "./plugin-src/errors.txt" ]; then
+            ERROR_MSG=$(cat ./plugin-src/errors.txt | head -30 | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2500)
+          elif [ -f "./plugin-src/build.log" ]; then
+            ERROR_MSG=$(tail -c 2500 ./plugin-src/build.log | tr '\n' '|' | sed 's/"/\\"/g')
+          else
+            ERROR_MSG="Build failed - no log available"
           fi
 
           curl -X POST "$CALLBACK_URL" \
