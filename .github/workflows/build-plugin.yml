@@ -1,18 +1,10 @@
-name: Build Minecraft Plugin
+name: Generate AI Plugin
 
 on:
   workflow_dispatch:
     inputs:
-      build_id:
-        description: 'Unique build ID'
-        required: true
-        type: string
-      plugin_name:
-        description: 'Plugin main class name'
-        required: true
-        type: string
-      callback_url:
-        description: 'Callback URL'
+      job_id:
+        description: 'Unique job ID'
         required: true
         type: string
 
@@ -20,124 +12,84 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify Secrets
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: |
-          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
-            echo "❌ Missing Supabase secrets!"
-            exit 1
-          fi
-          echo "✅ Secrets present"
-
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          distribution: 'temurin'
-          java-version: '21'
+          node-version: '20'
 
-      - name: Download source from Supabase
+      - name: Fetch Job Details
+        id: job
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          BUILD_ID: ${{ github.event.inputs.build_id }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
         run: |
-          mkdir -p plugin-src
-          cd plugin-src
-          DOWNLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/sources/$BUILD_ID.zip"
-          HTTP_CODE=$(curl -s -L -w "%{http_code}" -o source.zip \
+          JOB_DATA=$(curl -s -X GET \
+            "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID&select=*" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-            -H "apikey: $SUPABASE_SERVICE_KEY" \
-            "$DOWNLOAD_URL")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Source download failed (HTTP $HTTP_CODE)"
-            exit 1
-          fi
-          unzip -q source.zip && rm source.zip
-          echo "✅ Source extracted"
-          find . -type f
+            -H "apikey: $SUPABASE_SERVICE_KEY")
+          
+          echo "Job data fetched"
+          
+          # Extract prompt and is_chat flag using jq
+          PROMPT=$(echo "$JOB_DATA" | jq -r '.[0].prompt')
+          IS_CHAT=$(echo "$JOB_DATA" | jq -r '.[0].is_chat')
+          
+          echo "prompt<<EOF" >> $GITHUB_OUTPUT
+          echo "$PROMPT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "is_chat=$IS_CHAT" >> $GITHUB_OUTPUT
 
-      - name: Build with Maven
-        id: maven
-        working-directory: ./plugin-src
+      - name: Call AI Provider
+        id: ai
+        env:
+          DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
+          NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PROMPT: ${{ steps.job.outputs.prompt }}
+          IS_CHAT: ${{ steps.job.outputs.is_chat }}
         run: |
-          echo "Starting Maven build..."
-          set +e
-          mvn -B clean package -DskipTests 2>&1 | tee build.log
-          MVN_EXIT=$?
-          set -e
+          node scripts/generate.js
 
-          if [ $MVN_EXIT -ne 0 ]; then
-            echo "❌ Maven build failed"
-            # Extract only ERROR lines for cleaner callback
-            grep -E "\[ERROR\]|error:" build.log | head -50 > errors.txt || true
-            echo "BUILD_FAILED=true" >> $GITHUB_ENV
-            exit 1
-          fi
-
-          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
-          if [ -z "$JAR_FILE" ]; then
-            echo "❌ No JAR found!"
-            exit 1
-          fi
-          echo "jar_path=$JAR_FILE" >> $GITHUB_OUTPUT
-          echo "✅ Found JAR: $JAR_FILE"
-
-      - name: Upload JAR to Supabase
+      - name: Save Result to Supabase
         if: success()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          BUILD_ID: ${{ github.event.inputs.build_id }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          RESULT_FILE: ${{ steps.ai.outputs.result_file }}
         run: |
-          JAR_FILE="./plugin-src/${{ steps.maven.outputs.jar_path }}"
-          UPLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/artifacts/$BUILD_ID.jar"
-          HTTP_CODE=$(curl -s -X POST -w "%{http_code}" -o /dev/null \
+          # Read the result file and escape it for JSON
+          RESULT_CONTENT=$(cat "$RESULT_FILE" | jq -Rs .)
+          
+          curl -X PATCH \
+            "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
-            -H "Content-Type: application/java-archive" \
-            --data-binary "@$JAR_FILE" \
-            "$UPLOAD_URL")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ JAR upload failed (HTTP $HTTP_CODE)"
-            exit 1
-          fi
-          echo "✅ JAR uploaded"
-
-      - name: Notify Backend - Success
-        if: success()
-        env:
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
-          BUILD_ID: ${{ github.event.inputs.build_id }}
-        run: |
-          curl -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"success\",\"artifact_key\":\"artifacts/$BUILD_ID.jar\"}"
+            -H "Prefer: return=minimal" \
+            -d "{\"status\":\"success\",\"result\":$RESULT_CONTENT,\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
 
-      - name: Notify Backend - Failure
+      - name: Mark Job as Failed
         if: failure()
         env:
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
-          BUILD_ID: ${{ github.event.inputs.build_id }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
         run: |
-          # Extract concise error (only compile errors)
-          if [ -f "./plugin-src/errors.txt" ]; then
-            ERROR_MSG=$(cat ./plugin-src/errors.txt | head -30 | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2500)
-          elif [ -f "./plugin-src/build.log" ]; then
-            ERROR_MSG=$(tail -c 2500 ./plugin-src/build.log | tr '\n' '|' | sed 's/"/\\"/g')
-          else
-            ERROR_MSG="Build failed - no log available"
-          fi
-
-          curl -X POST "$CALLBACK_URL" \
+          curl -X PATCH \
+            "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"$BUILD_ID\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
+            -H "Prefer: return=minimal" \
+            -d "{\"status\":\"failed\",\"error\":\"AI generation failed - check GitHub Actions logs\"}"
