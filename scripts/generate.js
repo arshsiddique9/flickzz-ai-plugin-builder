@@ -7,8 +7,14 @@ const fs = require('fs');
 const DAHL_API_KEY = process.env.DAHL_API_KEY;
 const NARA_API_KEY = process.env.NARA_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const PROMPT = process.env.PROMPT;
+const PROMPT_B64 = process.env.PROMPT_B64;
 const IS_CHAT = process.env.IS_CHAT === 'true';
+
+// 🔧 Decode base64 prompt
+const PROMPT = Buffer.from(PROMPT_B64 || '', 'base64').toString('utf-8');
+
+console.log(`📝 Prompt decoded: ${PROMPT.length} chars`);
+console.log(`💬 Is chat: ${IS_CHAT}`);
 
 const SYSTEM_PROMPT = `You are FlickZZ Builder AI — the official AI assistant of FlickZZ Resources, created by Arsh Siddique.
 
@@ -34,7 +40,7 @@ const SYSTEM_PROMPT = `You are FlickZZ Builder AI — the official AI assistant 
 - Faltu comments/blank lines mat likho
 
 🚨 HTML ESCAPING RULE:
-- Use LITERAL < and > characters. NEVER escape them.
+- Use LITERAL < and > characters. NEVER escape them as &lt; or &gt;.
 
 🚫 NEVER ECHO USER PROMPT:
 - NEVER repeat user's message back.
@@ -135,8 +141,11 @@ async function tryProvider(provider, messages, systemPrompt, isChat) {
                 const choice = data.choices?.[0];
                 const content = choice?.message?.content || '';
                 const finishReason = choice?.finish_reason || 'unknown';
+                const contentLength = content.trim().length;
 
-                if (content.trim().length === 0) {
+                console.log(`📊 [${provider}] ${model}: ${contentLength} chars, ${finishReason}`);
+
+                if (contentLength === 0) {
                     lastError = `${model}: empty`;
                     continue;
                 }
@@ -179,12 +188,10 @@ async function main() {
         process.exit(1);
     }
 
-    // Save result to file for next step
-    fs.writeFileSync('ai-result.txt', result.content);
+    // Save result to file
+    fs.writeFileSync('ai-result.txt', result.content, 'utf-8');
     console.log('✅ Result saved to ai-result.txt');
-
-    // Set output for next step
-    fs.appendFileSync(process.env.GITHUB_OUTPUT, `result_file=ai-result.txt\n`);
+    console.log(`📊 Result size: ${result.content.length} chars`);
 }
 
 main().catch(err => {
