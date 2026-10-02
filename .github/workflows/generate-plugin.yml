@@ -1,0 +1,72 @@
+name: Generate AI Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Unique job ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch Job Details
+        id: job
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          JOB_DATA=$(curl -s -X GET "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID&select=*" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "apikey: $SUPABASE_SERVICE_KEY")
+          JOB_COUNT=$(echo "$JOB_DATA" | jq 'length')
+          if [ "$JOB_COUNT" = "0" ]; then
+            exit 1
+          fi
+          PROMPT=$(echo "$JOB_DATA" | jq -r '.[0].prompt')
+          IS_CHAT=$(echo "$JOB_DATA" | jq -r '.[0].is_chat // false')
+          PROMPT_B64=$(echo -n "$PROMPT" | base64 -w 0)
+          echo "prompt_b64=$PROMPT_B64" >> $GITHUB_OUTPUT
+          echo "is_chat=$IS_CHAT" >> $GITHUB_OUTPUT
+
+      - name: Call AI Provider
+        env:
+          DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
+          NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PROMPT_B64: ${{ steps.job.outputs.prompt_b64 }}
+          IS_CHAT: ${{ steps.job.outputs.is_chat }}
+        run: node scripts/generate.js
+
+      - name: Save Result to Supabase
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          RESULT_CONTENT=$(cat ai-result.txt | jq -Rs .)
+          curl -X PATCH "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "apikey: $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" -d "{\"status\":\"success\",\"result\":$RESULT_CONTENT,\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+      - name: Mark Job as Failed
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          curl -X PATCH "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "apikey: $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" -d "{\"status\":\"failed\",\"error\":\"AI generation failed\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
