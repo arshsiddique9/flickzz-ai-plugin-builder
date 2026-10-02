@@ -1,0 +1,149 @@
+name: Generate AI Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Unique job ID'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ═══════════════════════════════════════════
+      # STEP 1: Fetch job details from Supabase
+      # ═══════════════════════════════════════════
+      - name: Fetch Job Details
+        id: job
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          echo "📥 Fetching job: $JOB_ID"
+          
+          JOB_DATA=$(curl -s -X GET \
+            "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID&select=*" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY")
+          
+          echo "📊 Job data: $JOB_DATA"
+          
+          # Check if job exists
+          JOB_COUNT=$(echo "$JOB_DATA" | jq 'length')
+          if [ "$JOB_COUNT" = "0" ] || [ "$JOB_COUNT" = "null" ]; then
+            echo "❌ Job not found: $JOB_ID"
+            exit 1
+          fi
+          
+          # Extract prompt and is_chat (base64 encode prompt for safety)
+          PROMPT=$(echo "$JOB_DATA" | jq -r '.[0].prompt')
+          IS_CHAT=$(echo "$JOB_DATA" | jq -r '.[0].is_chat // false')
+          
+          # Base64 encode prompt to handle special chars/newlines
+          PROMPT_B64=$(echo -n "$PROMPT" | base64 -w 0)
+          
+          echo "✅ Job fetched"
+          echo "📝 Prompt length: ${#PROMPT} chars"
+          echo "💬 Is chat: $IS_CHAT"
+          
+          echo "prompt_b64=$PROMPT_B64" >> $GITHUB_OUTPUT
+          echo "is_chat=$IS_CHAT" >> $GITHUB_OUTPUT
+
+      # ═══════════════════════════════════════════
+      # STEP 2: Call AI Provider
+      # ═══════════════════════════════════════════
+      - name: Call AI Provider
+        id: ai
+        env:
+          DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
+          NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PROMPT_B64: ${{ steps.job.outputs.prompt_b64 }}
+          IS_CHAT: ${{ steps.job.outputs.is_chat }}
+        run: |
+          echo "🤖 Calling AI provider..."
+          node scripts/generate.js
+          
+          if [ ! -f "ai-result.txt" ]; then
+            echo "❌ Result file not created"
+            exit 1
+          fi
+          
+          RESULT_SIZE=$(wc -c < ai-result.txt)
+          echo "✅ Result generated: $RESULT_SIZE bytes"
+          
+          echo "result_file=ai-result.txt" >> $GITHUB_OUTPUT
+
+      # ═══════════════════════════════════════════
+      # STEP 3: Save Result to Supabase
+      # ═══════════════════════════════════════════
+      - name: Save Result to Supabase
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          RESULT_FILE: ai-result.txt
+        run: |
+          echo "💾 Saving result to Supabase..."
+          
+          # Read result and JSON-escape it
+          RESULT_CONTENT=$(cat "$RESULT_FILE" | jq -Rs .)
+          
+          # Update job record
+          HTTP_CODE=$(curl -s -X PATCH -w "%{http_code}" -o /dev/null \
+            "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{\"status\":\"success\",\"result\":$RESULT_CONTENT,\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}")
+          
+          echo "📊 Supabase PATCH status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" != "204" ] && [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️ Warning: Supabase update returned HTTP $HTTP_CODE"
+          else
+            echo "✅ Result saved to Supabase"
+          fi
+
+      # ═══════════════════════════════════════════
+      # STEP 4: Mark Job as Failed (only on failure)
+      # ═══════════════════════════════════════════
+      - name: Mark Job as Failed
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          echo "❌ Marking job as failed..."
+          
+          # Get last error from log if possible
+          ERROR_MSG="AI generation failed - check GitHub Actions logs"
+          
+          curl -s -X PATCH \
+            "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{\"status\":\"failed\",\"error\":\"$ERROR_MSG\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+          
+          echo "✅ Job marked as failed"
