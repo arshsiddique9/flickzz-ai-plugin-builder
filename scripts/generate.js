@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Multi-Pass Generation Engine (v5)
-// FIXED: generatedMap context bug + Dahl timeout
+// FlickZZ Builder — Multi-Pass Generation Engine (v5.1)
+// FIXED: generatedMap context bug + Dahl timeout + AgentRouter integration
 // ============================================
 
 const fs = require('fs');
@@ -8,6 +8,7 @@ const fs = require('fs');
 const DAHL_API_KEY = process.env.DAHL_API_KEY;
 const NARA_API_KEY = process.env.NARA_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const AGENTROUTER_API_KEY = process.env.AGENTROUTER_API_KEY; // ✅ NEW
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const JOB_ID = process.env.JOB_ID;
@@ -120,6 +121,18 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
             url: 'https://openrouter.ai/api/v1/chat/completions',
             key: OPENROUTER_API_KEY,
             models: ['qwen/qwen3-coder:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'openai/gpt-oss-120b:free'],
+            extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' }
+        },
+        // ✅ NEW: AgentRouter Provider (image se best models)
+        {
+            name: 'AgentRouter',
+            url: 'https://agentrouter.org/v1/chat/completions',
+            key: AGENTROUTER_API_KEY,
+            models: [
+                'gpt-6-astra',           // OpenAI (image)
+                'claude-opus-4-8',       // Anthropic (image)
+                'deepseek-v4-flash'      // DeepSeek (image)
+            ],
             extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' }
         }
     ];
@@ -267,7 +280,12 @@ function getFallbackPlan(pluginName = 'GeneratedPlugin') {
             { path: 'pom.xml', purpose: 'Maven build file' },
             { path: 'src/main/resources/plugin.yml', purpose: 'Plugin manifest' },
             { path: 'src/main/resources/config.yml', purpose: 'Plugin configuration' },
-            { path: `src/main/java/${pkg.replace(/\./g, '/')}/${pluginName}.java`, purpose: 'Main plugin class' }
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/${pluginName}.java`, purpose: 'Main plugin class' },
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/commands/HomeCommand.java`, purpose: 'Command handler' },
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/managers/HomeManager.java`, purpose: 'Data manager' },
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/listeners/PlayerListener.java`, purpose: 'Event listener' },
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/utils/MessageUtil.java`, purpose: 'Message utility' },
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/utils/ConfigUtil.java`, purpose: 'Config utility' }
         ]
     };
 }
@@ -317,7 +335,8 @@ STANDARDS:
 
 Output ONLY the JSON object now.`;
 
-    const result = await callAI(systemPrompt, userPrompt, 3000);
+    // 🔧 FIX: max_tokens 3000 se badhakar 5000 kiya (9 files ka plan aaram se aayega)
+    const result = await callAI(systemPrompt, userPrompt, 5000);
 
     if (!result.ok) {
         console.log('  All providers failed for planning, using fallback plan');
