@@ -14,7 +14,7 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -32,18 +32,25 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           JOB_ID: ${{ github.event.inputs.job_id }}
         run: |
-          JOB_DATA=$(curl -s -X GET "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID&select=*" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "apikey: $SUPABASE_SERVICE_KEY")
+          JOB_DATA=$(curl -s -X GET "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID&select=*" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY")
+
           JOB_COUNT=$(echo "$JOB_DATA" | jq 'length')
           if [ "$JOB_COUNT" = "0" ]; then
+            echo "Job not found: $JOB_ID"
             exit 1
           fi
+
           PROMPT=$(echo "$JOB_DATA" | jq -r '.[0].prompt')
           IS_CHAT=$(echo "$JOB_DATA" | jq -r '.[0].is_chat // false')
           PROMPT_B64=$(echo -n "$PROMPT" | base64 -w 0)
+
           echo "prompt_b64=$PROMPT_B64" >> $GITHUB_OUTPUT
           echo "is_chat=$IS_CHAT" >> $GITHUB_OUTPUT
 
       - name: Call AI Provider
+        id: ai
         env:
           DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
           NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
@@ -80,16 +87,18 @@ jobs:
             -H "Prefer: return=minimal" \
             -d "{\"status\":\"success\",\"result\":$RESULT_CONTENT,\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
 
-      - name: Mark Job as Failed
-        if: failure()
+      - name: Mark Job as Failed (Failure or Cancel)
+        if: always() && !success()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           JOB_ID: ${{ github.event.inputs.job_id }}
         run: |
+          echo "Job did not succeed — marking as failed in Supabase"
+
           curl -X PATCH "$SUPABASE_URL/rest/v1/ai_jobs?id=eq.$JOB_ID" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
-            -d "{\"status\":\"failed\",\"error\":\"AI generation failed\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+            -d "{\"status\":\"failed\",\"error\":\"Backend timeout or crash (workflow did not complete)\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
