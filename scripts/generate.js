@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Multi-Pass Generation Engine (v5.1)
-// FIXED: generatedMap context bug + Dahl timeout + AgentRouter integration
+// FlickZZ Builder — Multi-Pass Generation Engine (v5.2)
+// FIXED: Added UNOROUTER & Token Harbor providers
 // ============================================
 
 const fs = require('fs');
@@ -8,7 +8,9 @@ const fs = require('fs');
 const DAHL_API_KEY = process.env.DAHL_API_KEY;
 const NARA_API_KEY = process.env.NARA_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const AGENTROUTER_API_KEY = process.env.AGENTROUTER_API_KEY; // ✅ NEW
+const AGENTROUTER_API_KEY = process.env.AGENTROUTER_API_KEY;
+const UNOROUTER_API_KEY = process.env.UNOROUTER_API_KEY; // ✅ NEW
+const TOKENHARBOR_API_KEY = process.env.TOKENHARBOR_API_KEY; // ✅ NEW
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const JOB_ID = process.env.JOB_ID;
@@ -123,17 +125,26 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
             models: ['qwen/qwen3-coder:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'openai/gpt-oss-120b:free'],
             extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' }
         },
-        // ✅ NEW: AgentRouter Provider (image se best models)
         {
             name: 'AgentRouter',
             url: 'https://agentrouter.org/v1/chat/completions',
             key: AGENTROUTER_API_KEY,
-            models: [
-                'gpt-6-astra',           // OpenAI (image)
-                'claude-opus-4-8',       // Anthropic (image)
-                'deepseek-v4-flash'      // DeepSeek (image)
-            ],
+            models: ['gpt-6-astra', 'claude-opus-4-8', 'deepseek-v4-flash'],
             extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' }
+        },
+        // ✅ NEW: UNOROUTER Provider
+        {
+            name: 'UNOROUTER',
+            url: 'https://api.unorouter.com/v1/chat/completions',
+            key: UNOROUTER_API_KEY,
+            models: ['gemini-3.5-flash-lite:free', 'nemotron-3-ultra-550b-a55b:free', 'deepseek-v4-flash:free']
+        },
+        // ✅ NEW: Token Harbor Provider
+        {
+            name: 'TokenHarbor',
+            url: 'https://api.tokenharbor.ai/v1/chat/completions',
+            key: TOKENHARBOR_API_KEY,
+            models: ['qwen3.8-flash:free', 'deepseek-v4.1-flash:free', 'mimo-v2.6-flash:free']
         }
     ];
 
@@ -162,7 +173,6 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
                     };
 
                     const controller = new AbortController();
-                    // 🔧 FIX: Dahl timeout 240s → 90s (Dahl 524 error jaldi detect karo, next model try karo)
                     const timeoutId = setTimeout(() => controller.abort(), 90000);
 
                     const res = await fetch(provider.url, {
@@ -335,7 +345,6 @@ STANDARDS:
 
 Output ONLY the JSON object now.`;
 
-    // 🔧 FIX: max_tokens 3000 se badhakar 5000 kiya (9 files ka plan aaram se aayega)
     const result = await callAI(systemPrompt, userPrompt, 5000);
 
     if (!result.ok) {
@@ -361,7 +370,6 @@ Output ONLY the JSON object now.`;
 
 // ═══════════════════════════════════════════
 // SMART CONTEXT
-// 🔧 FIXED: Handle both string and object types safely
 // ═══════════════════════════════════════════
 function buildContext(file, alreadyGenerated, plan) {
     if (!alreadyGenerated || alreadyGenerated.length === 0) return '';
@@ -375,7 +383,6 @@ function buildContext(file, alreadyGenerated, plan) {
         return '\n\n(No context needed - main entry point)';
     }
 
-    // 🔧 FIX: Safely filter — handle both string and object entries
     const relevantFiles = alreadyGenerated.filter((f) => {
         const filePath = (typeof f === 'string') ? f : (f && f.path ? f.path : '');
         if (!filePath) return false;
@@ -388,7 +395,6 @@ function buildContext(file, alreadyGenerated, plan) {
 
     if (relevantFiles.length === 0) return '';
 
-    // 🔧 FIX: Safely format — handle both string and object entries
     const contextStr = relevantFiles.map((f) => {
         if (typeof f === 'string') {
             return `### (content)\n${f}`;
@@ -552,7 +558,6 @@ function setFileStatus(fileList, filePath, status, options = {}) {
 // ═══════════════════════════════════════════
 async function main() {
     try {
-        // ═══ CHAT MODE ═══
         if (IS_CHAT) {
             await updateProgress({ stage: 'chatting', currentStep: 1, totalSteps: 1 });
             const response = await handleChat(USER_PROMPT);
@@ -562,15 +567,12 @@ async function main() {
             return;
         }
 
-        // ═══ BUILD MODE ═══
         console.log('\n═══ BUILD MODE ═══');
         const jobStartTime = Date.now();
 
-        // Step 1: Plan
         let plan = await planPlugin(USER_PROMPT);
         plan = validatePlan(plan);
 
-        // Initialize file list with tracking
         const fileList = plan.files.map(f => ({
             path: f.path,
             name: f.path.split('/').pop(),
@@ -583,7 +585,6 @@ async function main() {
             model: null
         }));
 
-        // 🔧 FIX: Map will store OBJECTS with {path, content} instead of raw strings
         const generatedMap = new Map();
 
         await updateProgress({
@@ -597,7 +598,6 @@ async function main() {
             pass: 1
         });
 
-        // ═══ MULTI-PASS GENERATION ═══
         const MAX_FILE_RETRIES = 2;
         const MAX_PASSES = 3;
 
@@ -650,11 +650,9 @@ async function main() {
                             await new Promise(r => setTimeout(r, 3000));
                         }
 
-                        // 🔧 FIX: Pass proper objects array
                         const contextFiles = Array.from(generatedMap.values());
                         const content = await generateFile(fileDef, plan, contextFiles);
 
-                        // 🔧 CRITICAL FIX: Store as object {path, content} instead of raw string
                         generatedMap.set(fileEntry.path, {
                             path: fileEntry.path,
                             content: content
@@ -729,7 +727,6 @@ async function main() {
             }
         }
 
-        // ═══ CHECK FINAL STATUS ═══
         const failedFiles = fileList.filter(f => f.status === 'failed');
         const skippedFiles = fileList.filter(f => f.status === 'skipped');
         const completedFiles = fileList.filter(f => f.status === 'completed');
@@ -741,7 +738,6 @@ async function main() {
         console.log(`Failed: ${failedFiles.length}`);
         console.log(`Total time: ${(jobDuration / 1000).toFixed(1)}s`);
 
-        // ═══ FINALIZE ═══
         await updateProgress({
             stage: 'finalizing',
             currentStep: plan.files.length,
@@ -752,7 +748,6 @@ async function main() {
             totalDuration: jobDuration
         });
 
-        // 🔧 FIX: Extract .content from the object
         const fileOutput = [];
         for (const fileEntry of fileList) {
             if (fileEntry.status === 'completed' && generatedMap.has(fileEntry.path)) {
@@ -771,7 +766,6 @@ ${fileOutput.join('\n\n')}
         fs.writeFileSync('ai-result.txt', finalOutput, 'utf-8');
         console.log(`\nSaved ${finalOutput.length} chars to ai-result.txt`);
 
-        // ═══ MARK JOB STATUS ═══
         if (failedFiles.length > 0) {
             const errorMsg = `Could not generate ${failedFiles.length} file(s): ${failedFiles.map(f => f.name).join(', ')}`;
             await updateProgress({
