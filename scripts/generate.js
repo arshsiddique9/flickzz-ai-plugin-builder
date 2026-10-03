@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Multi-Pass Generation Engine (v3)
-// File skip + retry passes + model health tracking
+// FlickZZ Builder — Multi-Pass Generation Engine (v4)
+// File skip + retry passes + model health + timing
 // ============================================
 
 const fs = require('fs');
@@ -17,8 +17,7 @@ const IS_CHAT = process.env.IS_CHAT === 'true';
 const USER_PROMPT = Buffer.from(PROMPT_B64 || '', 'base64').toString('utf-8');
 
 // ═══════════════════════════════════════════
-// MODEL HEALTH TRACKING (per-job)
-// If a model fails repeatedly, deprioritize it
+// MODEL HEALTH TRACKING
 // ═══════════════════════════════════════════
 const modelHealth = {};
 
@@ -43,7 +42,6 @@ function isModelHealthy(provider, model) {
     const key = getModelKey(provider, model);
     const h = modelHealth[key];
     if (!h) return true;
-    // Disable model after 3 consecutive net failures
     return (h.success - h.fail) > -3;
 }
 
@@ -136,7 +134,6 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
             if (!provider.key) continue;
 
             for (const model of provider.models) {
-                // 🔧 Skip unhealthy models (only in non-first attempts to give them a chance)
                 if (attempt > 0 && !isModelHealthy(provider.name, model)) {
                     console.log(`  [${provider.name}] ${model} — SKIPPED (unhealthy)`);
                     continue;
@@ -279,6 +276,8 @@ function getFallbackPlan(pluginName = 'GeneratedPlugin') {
 // ═══════════════════════════════════════════
 async function planPlugin(userPrompt) {
     console.log('\nPLANNING PHASE');
+    const planStartTime = Date.now();
+
     await updateProgress({
         stage: 'planning',
         currentStep: 0,
@@ -334,7 +333,8 @@ Output ONLY the JSON object now.`;
     if (!plan.pluginName) plan.pluginName = 'GeneratedPlugin';
     plan.pluginName = plan.pluginName.replace(/[^a-zA-Z0-9]/g, '');
 
-    console.log(`Planned ${plan.files.length} files [${plan.complexity || 'unknown'}]:`);
+    const planDuration = Date.now() - planStartTime;
+    console.log(`Planned ${plan.files.length} files [${plan.complexity || 'unknown'}] in ${(planDuration / 1000).toFixed(1)}s`);
     plan.files.forEach((f, i) => console.log(`  ${i + 1}. ${f.path}`));
     return plan;
 }
@@ -499,14 +499,19 @@ function validatePlan(plan) {
 }
 
 // ═══════════════════════════════════════════
-// HELPER: Update file status in fileList
+// HELPER: Update file status with timing
 // ═══════════════════════════════════════════
-function setFileStatus(fileList, filePath, status, size = null) {
+function setFileStatus(fileList, filePath, status, options = {}) {
     const file = fileList.find(f => f.path === filePath);
-    if (file) {
-        file.status = status;
-        if (size !== null) file.size = size;
-    }
+    if (!file) return fileList;
+
+    file.status = status;
+
+    if (options.size !== undefined) file.size = options.size;
+    if (options.startedAt !== undefined) file.startedAt = options.startedAt;
+    if (options.duration !== undefined) file.duration = options.duration;
+    if (options.model !== undefined) file.model = options.model;
+
     return fileList;
 }
 
@@ -527,6 +532,7 @@ async function main() {
 
         // ═══ BUILD MODE ═══
         console.log('\n═══ BUILD MODE ═══');
+        const jobStartTime = Date.now();
 
         // Step 1: Plan
         let plan = await planPlugin(USER_PROMPT);
@@ -539,10 +545,13 @@ async function main() {
             status: 'pending',
             size: 0,
             attempts: 0,
-            lastPass: 0
+            lastPass: 0,
+            startedAt: null,
+            duration: null,
+            model: null
         }));
 
-        const generatedMap = new Map(); // path -> content
+        const generatedMap = new Map();
 
         await updateProgress({
             stage: 'planned',
@@ -556,8 +565,8 @@ async function main() {
         });
 
         // ═══ MULTI-PASS GENERATION ═══
-        const MAX_FILE_RETRIES = 2;   // Retries per file per pass
-        const MAX_PASSES = 3;          // Total passes for skipped files
+        const MAX_FILE_RETRIES = 2;
+        const MAX_PASSES = 3;
 
         for (let pass = 1; pass <= MAX_PASSES; pass++) {
             const filesToDo = fileList.filter(f => f.status === 'pending' || f.status === 'skipped');
@@ -573,16 +582,21 @@ async function main() {
             for (let i = 0; i < fileList.length; i++) {
                 const fileEntry = fileList[i];
 
-                // Skip already completed files
                 if (fileEntry.status === 'completed') continue;
-                // Skip files failed permanently
                 if (fileEntry.status === 'failed') continue;
 
                 const fileDef = plan.files.find(f => f.path === fileEntry.path);
                 if (!fileDef) continue;
 
-                // Update: generating
-                setFileStatus(fileList, fileEntry.path, 'generating');
+                // 🔧 Mark generation start time (only if not already started)
+                const fileStartTime = Date.now();
+                fileEntry.startedAt = fileStartTime;
+                fileEntry.attempts = (fileEntry.attempts || 0) + 1;
+                fileEntry.lastPass = pass;
+
+                setFileStatus(fileList, fileEntry.path, 'generating', {
+                    startedAt: fileStartTime
+                });
 
                 await updateProgress({
                     stage: 'generating',
@@ -596,6 +610,8 @@ async function main() {
 
                 let success = false;
                 let lastError = null;
+                let usedProvider = null;
+                let usedModel = null;
 
                 for (let attempt = 0; attempt <= MAX_FILE_RETRIES && !success; attempt++) {
                     try {
@@ -607,7 +623,19 @@ async function main() {
                         const content = await generateFile(fileDef, plan, Array.from(generatedMap.values()));
                         generatedMap.set(fileEntry.path, content);
                         success = true;
-                        setFileStatus(fileList, fileEntry.path, 'completed', content.length);
+
+                        // 🔧 Calculate duration
+                        const duration = Date.now() - fileStartTime;
+
+                        fileEntry.duration = duration;
+                        fileEntry.size = content.length;
+
+                        setFileStatus(fileList, fileEntry.path, 'completed', {
+                            size: content.length,
+                            duration: duration
+                        });
+
+                        console.log(`  ✅ Completed in ${(duration / 1000).toFixed(1)}s`);
 
                         await updateProgress({
                             stage: 'generating',
@@ -624,12 +652,12 @@ async function main() {
                 }
 
                 if (!success) {
-                    fileEntry.attempts = (fileEntry.attempts || 0) + 1;
-                    fileEntry.lastPass = pass;
+                    const duration = Date.now() - fileStartTime;
 
                     if (pass >= MAX_PASSES) {
-                        // Permanent failure — no more passes
-                        setFileStatus(fileList, fileEntry.path, 'failed');
+                        setFileStatus(fileList, fileEntry.path, 'failed', {
+                            duration: duration
+                        });
 
                         await updateProgress({
                             stage: 'generating',
@@ -643,8 +671,9 @@ async function main() {
 
                         console.warn(`File ${fileEntry.path} FAILED permanently (all passes exhausted)`);
                     } else {
-                        // Temporary skip — retry in next pass
-                        setFileStatus(fileList, fileEntry.path, 'skipped');
+                        setFileStatus(fileList, fileEntry.path, 'skipped', {
+                            duration: duration
+                        });
 
                         await updateProgress({
                             stage: 'generating',
@@ -659,7 +688,6 @@ async function main() {
                         console.warn(`File ${fileEntry.path} SKIPPED — will retry in pass ${pass + 1}`);
                     }
 
-                    // Small delay before next file
                     await new Promise(r => setTimeout(r, 2000));
                 }
             }
@@ -669,11 +697,13 @@ async function main() {
         const failedFiles = fileList.filter(f => f.status === 'failed');
         const skippedFiles = fileList.filter(f => f.status === 'skipped');
         const completedFiles = fileList.filter(f => f.status === 'completed');
+        const jobDuration = Date.now() - jobStartTime;
 
         console.log(`\n═══ RESULTS ═══`);
         console.log(`Completed: ${completedFiles.length}/${fileList.length}`);
         console.log(`Skipped: ${skippedFiles.length}`);
         console.log(`Failed: ${failedFiles.length}`);
+        console.log(`Total time: ${(jobDuration / 1000).toFixed(1)}s`);
 
         // ═══ FINALIZE ═══
         await updateProgress({
@@ -682,10 +712,10 @@ async function main() {
             totalSteps: plan.files.length,
             files: fileList,
             currentFile: 'Assembling final package',
-            pass: MAX_PASSES
+            pass: MAX_PASSES,
+            totalDuration: jobDuration
         });
 
-        // Build output from all completed files
         const fileOutput = [];
         for (const fileEntry of fileList) {
             if (fileEntry.status === 'completed' && generatedMap.has(fileEntry.path)) {
@@ -704,7 +734,6 @@ ${fileOutput.join('\n\n')}
 
         // ═══ MARK JOB STATUS ═══
         if (failedFiles.length > 0) {
-            // Some files couldn't be generated — mark as failed
             const errorMsg = `Could not generate ${failedFiles.length} file(s): ${failedFiles.map(f => f.name).join(', ')}`;
             await updateProgress({
                 stage: 'failed',
@@ -712,7 +741,8 @@ ${fileOutput.join('\n\n')}
                 totalSteps: plan.files.length,
                 files: fileList,
                 error: errorMsg,
-                pass: MAX_PASSES
+                pass: MAX_PASSES,
+                totalDuration: jobDuration
             });
             throw new Error(errorMsg);
         }
@@ -723,7 +753,8 @@ ${fileOutput.join('\n\n')}
             totalSteps: plan.files.length,
             files: fileList,
             currentFile: null,
-            pass: MAX_PASSES
+            pass: MAX_PASSES,
+            totalDuration: jobDuration
         });
 
     } catch (err) {
