@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Smart Chunked Generation Engine (v2)
-// Fixed: HTML responses, JSON parsing, fallback plan
+// FlickZZ Builder — Multi-Pass Generation Engine (v3)
+// File skip + retry passes + model health tracking
 // ============================================
 
 const fs = require('fs');
@@ -15,6 +15,37 @@ const PROMPT_B64 = process.env.PROMPT_B64;
 const IS_CHAT = process.env.IS_CHAT === 'true';
 
 const USER_PROMPT = Buffer.from(PROMPT_B64 || '', 'base64').toString('utf-8');
+
+// ═══════════════════════════════════════════
+// MODEL HEALTH TRACKING (per-job)
+// If a model fails repeatedly, deprioritize it
+// ═══════════════════════════════════════════
+const modelHealth = {};
+
+function getModelKey(provider, model) {
+    return `${provider}:${model}`;
+}
+
+function trackSuccess(provider, model) {
+    const key = getModelKey(provider, model);
+    if (!modelHealth[key]) modelHealth[key] = { fail: 0, success: 0 };
+    modelHealth[key].success++;
+    modelHealth[key].fail = Math.max(0, modelHealth[key].fail - 1);
+}
+
+function trackFailure(provider, model) {
+    const key = getModelKey(provider, model);
+    if (!modelHealth[key]) modelHealth[key] = { fail: 0, success: 0 };
+    modelHealth[key].fail++;
+}
+
+function isModelHealthy(provider, model) {
+    const key = getModelKey(provider, model);
+    const h = modelHealth[key];
+    if (!h) return true;
+    // Disable model after 3 consecutive net failures
+    return (h.success - h.fail) > -3;
+}
 
 console.log(`Prompt: ${USER_PROMPT.length} chars`);
 console.log(`Is chat: ${IS_CHAT}`);
@@ -42,38 +73,35 @@ async function updateProgress(updates) {
             },
             body: JSON.stringify(body)
         });
-        console.log(`Progress [${updates.stage || '?'}] step ${updates.currentStep || 0}/${updates.totalSteps || 0}`);
+        console.log(`Progress [${updates.stage || '?'}] step ${updates.currentStep || 0}/${updates.totalSteps || 0}${updates.pass ? ` pass ${updates.pass}` : ''}`);
     } catch (err) {
         console.error('Progress update failed:', err.message);
     }
 }
 
 // ═══════════════════════════════════════════
-// 🔧 CONTENT VALIDATION — Reject HTML/errors
+// CONTENT VALIDATION
 // ═══════════════════════════════════════════
 function isValidContent(content) {
     if (!content || typeof content !== 'string') return false;
     const trimmed = content.trim();
     if (trimmed.length === 0) return false;
 
-    // Reject HTML responses (Cloudflare error pages, etc.)
     if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html') || trimmed.startsWith('<HTML')) {
         return false;
     }
 
-    // Reject Cloudflare/error JSON envelopes
     if (trimmed.startsWith('{') && /"(error|errors|message)".*"(rate|limit|unavailable|forbidden|not found|model_)/i.test(trimmed.substring(0, 300))) {
         return false;
     }
 
-    // Reject very short responses
     if (trimmed.length < 20) return false;
 
     return true;
 }
 
 // ═══════════════════════════════════════════
-// AI PROVIDER — with retry, fallback, validation
+// AI PROVIDER — with health-aware routing
 // ═══════════════════════════════════════════
 async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
     const providers = [
@@ -108,6 +136,12 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
             if (!provider.key) continue;
 
             for (const model of provider.models) {
+                // 🔧 Skip unhealthy models (only in non-first attempts to give them a chance)
+                if (attempt > 0 && !isModelHealthy(provider.name, model)) {
+                    console.log(`  [${provider.name}] ${model} — SKIPPED (unhealthy)`);
+                    continue;
+                }
+
                 try {
                     console.log(`[${provider.name}] ${model} (max ${maxTokens} tokens)`);
 
@@ -140,13 +174,14 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
                     if (!res.ok) {
                         const errText = await res.text();
                         console.log(`  ${res.status}: ${errText.substring(0, 80)}`);
+                        trackFailure(provider.name, model);
                         continue;
                     }
 
-                    // 🔧 Check content-type to reject HTML
                     const contentType = res.headers.get('content-type') || '';
                     if (!contentType.includes('application/json')) {
                         console.log(`  Invalid content-type: ${contentType}`);
+                        trackFailure(provider.name, model);
                         continue;
                     }
 
@@ -154,22 +189,24 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
                     const content = data.choices?.[0]?.message?.content || '';
                     const finishReason = data.choices?.[0]?.finish_reason || 'unknown';
 
-                    // 🔧 Validate content
                     if (!isValidContent(content)) {
                         console.log(`  Invalid/empty response (${content.length} chars), trying next...`);
+                        trackFailure(provider.name, model);
                         continue;
                     }
 
-                    // If output was cut due to token limit, retry
                     if (finishReason === 'length' && attempt < retries) {
                         console.log(`  Hit token limit, will retry...`);
+                        trackFailure(provider.name, model);
                         break;
                     }
 
                     console.log(`  ${content.length} chars (${finishReason})`);
+                    trackSuccess(provider.name, model);
                     return { ok: true, content, finishReason, provider: provider.name, model };
                 } catch (err) {
                     console.log(`  ${err.message}`);
+                    trackFailure(provider.name, model);
                 }
             }
         }
@@ -179,24 +216,17 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
 }
 
 // ═══════════════════════════════════════════
-// 🔧 ROBUST JSON EXTRACTOR
+// ROBUST JSON EXTRACTOR
 // ═══════════════════════════════════════════
 function extractJSON(text) {
     if (!text) return null;
 
     let json = text.trim();
-
-    // Remove BOM
     json = json.replace(/^\uFEFF/, '');
-
-    // Remove markdown fences
     json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '');
-
-    // Remove thinking tags
     json = json.replace(/<think>[\s\S]*?<\/think>/gi, '');
     json = json.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
 
-    // Find the JSON boundaries
     const startIdx = json.indexOf('{');
     const endIdx = json.lastIndexOf('}');
 
@@ -206,31 +236,28 @@ function extractJSON(text) {
 
     json = json.substring(startIdx, endIdx + 1);
 
-    // Try parsing
     try {
         return JSON.parse(json);
     } catch (err) {
         console.log(`  JSON parse failed: ${err.message}`);
 
-        // Clean up common issues
         json = json
             .replace(/,\s*}/g, '}')
             .replace(/,\s*]/g, ']')
-            .replace(/\/\/[^\n]*/g, '')  // Remove // comments
-            .replace(/\/\*[\s\S]*?\*\//g, '');  // Remove /* */ comments
+            .replace(/\/\/[^\n]*/g, '')
+            .replace(/\/\*[\s\S]*?\*\//g, '');
 
         try {
             return JSON.parse(json);
         } catch (retryErr) {
             console.log(`  JSON parse failed after cleanup: ${retryErr.message}`);
-            console.log(`  Preview: ${json.substring(0, 300)}`);
             return null;
         }
     }
 }
 
 // ═══════════════════════════════════════════
-// 🔧 FALLBACK PLAN — If AI planning fails
+// FALLBACK PLAN
 // ═══════════════════════════════════════════
 function getFallbackPlan(pluginName = 'GeneratedPlugin') {
     const pkg = 'com.flickzz.generated';
@@ -272,46 +299,39 @@ async function planPlugin(userPrompt) {
 OUTPUT FORMAT:
 {"pluginName":"FlickZZHomes","description":"Short description","complexity":"simple|medium|complex|framework","files":[{"path":"pom.xml","purpose":"Maven build file"},{"path":"src/main/resources/plugin.yml","purpose":"Plugin manifest"},{"path":"src/main/resources/config.yml","purpose":"Config"},{"path":"src/main/java/com/flickzz/generated/FlickZZHomes.java","purpose":"Main class"}]}
 
-FILE COUNT RULES (choose based on complexity):
+FILE COUNT RULES:
 - Simple (1-2 commands): 4-5 files
 - Medium (3-5 commands): 6-9 files
 - Complex (GUI, admin, events): 10-18 files
 - Framework (multi-system): 18-35 files
 
-REQUIRED FILES (ALWAYS include):
+REQUIRED FILES:
 1. pom.xml
 2. src/main/resources/plugin.yml
-3. src/main/resources/config.yml (if configurable)
-4. Main class (JavaPlugin subclass) — MUST be FIRST Java file
+3. src/main/resources/config.yml
+4. Main class — FIRST Java file
 
 STANDARDS:
 - Paper API 1.21.1, Java 21
 - Package: com.flickzz.generated
-- Each file = ONE clear purpose
 
-Output ONLY the JSON object now. Start with {`;
+Output ONLY the JSON object now.`;
 
     const result = await callAI(systemPrompt, userPrompt, 3000);
-    
+
     if (!result.ok) {
         console.log('  All providers failed for planning, using fallback plan');
         return getFallbackPlan();
     }
 
     const plan = extractJSON(result.content);
-    
+
     if (!plan || !plan.files || !Array.isArray(plan.files) || plan.files.length === 0) {
         console.log('  Invalid plan from AI, using fallback plan');
-        console.log(`  Raw response preview: ${result.content.substring(0, 500)}`);
         return getFallbackPlan();
     }
 
-    // Ensure pluginName exists
-    if (!plan.pluginName) {
-        plan.pluginName = 'GeneratedPlugin';
-    }
-
-    // Sanitize pluginName (only alphanumeric)
+    if (!plan.pluginName) plan.pluginName = 'GeneratedPlugin';
     plan.pluginName = plan.pluginName.replace(/[^a-zA-Z0-9]/g, '');
 
     console.log(`Planned ${plan.files.length} files [${plan.complexity || 'unknown'}]:`);
@@ -388,23 +408,19 @@ COMMON MISTAKES (AVOID):
 - File.createNewFile() without try-catch
 - Sound.valueOf() / Particle.valueOf() without try-catch
 - Private methods called from another class
-- Wrong package
 - Bukkit.getWorld() without null check
 - getCommand("x") without null check
 
-Output ONLY the file content. Start immediately. NO preamble.`;
+Output ONLY the file content. Start immediately.`;
 
     const result = await callAI(systemPrompt, `Generate the complete file: ${file.path}`, 6000);
     if (!result.ok) throw new Error(`Failed to generate ${file.path}`);
 
     let content = result.content.trim();
-
-    // Clean up AI artifacts
     content = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
     content = content.replace(/^\/\/\s*(File:|Path:|Here is|This is).*\n/i, '');
     content = content.replace(/^(Here is|This is|Sure|Okay|Alright)[^\n]*\n+/i, '');
 
-    // For Java files, trim to last closing brace
     if (!isResource) {
         const lastBrace = content.lastIndexOf('}');
         if (lastBrace > 0 && lastBrace < content.length - 50) {
@@ -432,18 +448,16 @@ IDENTITY:
 - Name: FlickZZ Builder AI
 - Creator: Arsh Siddique (FlickZZ Resources)
 - NEVER mention: OpenAI, Anthropic, Claude, GPT, Gemini, or any real AI company
-- If asked "who made you?" → "Main FlickZZ Builder AI hoon, Arsh Siddique ne banaya hai."
 
 BEHAVIOR:
 - Reply in user's language (Hindi/Hinglish/English)
 - Keep responses short (under 100 words)
-- Do NOT use any thinking tags or internal monologue
+- NO thinking tags, NO internal monologue
 - Reply directly`;
 
     const result = await callAI(systemPrompt, userPrompt, 1500);
     if (!result.ok) throw new Error('Chat failed');
 
-    // Strip thinking tags from chat too
     let response = result.content;
     response = response.replace(/<think>[\s\S]*?<\/think>/gi, '');
     response = response.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
@@ -453,7 +467,7 @@ BEHAVIOR:
 }
 
 // ═══════════════════════════════════════════
-// VALIDATION
+// PLAN VALIDATION
 // ═══════════════════════════════════════════
 function validatePlan(plan) {
     const paths = plan.files.map(f => f.path.toLowerCase());
@@ -464,43 +478,44 @@ function validatePlan(plan) {
     const hasConfigYml = paths.some(p => p.includes('config.yml'));
     const hasMainClass = paths.some(p => p.endsWith(`${plan.pluginName.toLowerCase()}.java`));
 
-    const missing = [];
-    if (!hasPom) missing.push('pom.xml');
-    if (!hasPluginYml) missing.push('plugin.yml');
-    if (!hasMainClass) missing.push(`${plan.pluginName}.java`);
-
-    if (missing.length > 0) {
-        console.log(`Auto-fixing missing files: ${missing.join(', ')}`);
-        
-        if (!hasPom) {
-            plan.files.unshift({ path: 'pom.xml', purpose: 'Maven build file' });
-        }
-        if (!hasPluginYml) {
-            const idx = plan.files.findIndex(f => f.path.includes('pom.xml'));
-            plan.files.splice(idx + 1, 0, { path: 'src/main/resources/plugin.yml', purpose: 'Plugin manifest' });
-        }
-        if (!hasConfigYml) {
-            const idx = plan.files.findIndex(f => f.path.includes('plugin.yml'));
-            plan.files.splice(idx + 1, 0, { path: 'src/main/resources/config.yml', purpose: 'Configuration' });
-        }
-        if (!hasMainClass) {
-            const idx = plan.files.findIndex(f => f.path.includes('config.yml'));
-            plan.files.splice(idx + 1, 0, { 
-                path: `src/main/java/${pkg.replace(/\./g, '/')}/${plan.pluginName}.java`, 
-                purpose: 'Main plugin class' 
-            });
-        }
+    if (!hasPom) plan.files.unshift({ path: 'pom.xml', purpose: 'Maven build file' });
+    if (!hasPluginYml) {
+        const idx = plan.files.findIndex(f => f.path.includes('pom.xml'));
+        plan.files.splice(idx + 1, 0, { path: 'src/main/resources/plugin.yml', purpose: 'Plugin manifest' });
+    }
+    if (!hasConfigYml) {
+        const idx = plan.files.findIndex(f => f.path.includes('plugin.yml'));
+        plan.files.splice(idx + 1, 0, { path: 'src/main/resources/config.yml', purpose: 'Configuration' });
+    }
+    if (!hasMainClass) {
+        const idx = plan.files.findIndex(f => f.path.includes('config.yml'));
+        plan.files.splice(idx + 1, 0, {
+            path: `src/main/java/${pkg.replace(/\./g, '/')}/${plan.pluginName}.java`,
+            purpose: 'Main plugin class'
+        });
     }
 
     return plan;
 }
 
 // ═══════════════════════════════════════════
-// MAIN FLOW
+// HELPER: Update file status in fileList
+// ═══════════════════════════════════════════
+function setFileStatus(fileList, filePath, status, size = null) {
+    const file = fileList.find(f => f.path === filePath);
+    if (file) {
+        file.status = status;
+        if (size !== null) file.size = size;
+    }
+    return fileList;
+}
+
+// ═══════════════════════════════════════════
+// MAIN FLOW — Multi-Pass Generation
 // ═══════════════════════════════════════════
 async function main() {
     try {
-        // CHAT MODE
+        // ═══ CHAT MODE ═══
         if (IS_CHAT) {
             await updateProgress({ stage: 'chatting', currentStep: 1, totalSteps: 1 });
             const response = await handleChat(USER_PROMPT);
@@ -510,20 +525,24 @@ async function main() {
             return;
         }
 
-        // BUILD MODE
+        // ═══ BUILD MODE ═══
         console.log('\n═══ BUILD MODE ═══');
 
         // Step 1: Plan
         let plan = await planPlugin(USER_PROMPT);
         plan = validatePlan(plan);
 
-        // Initialize progress
+        // Initialize file list with tracking
         const fileList = plan.files.map(f => ({
             path: f.path,
             name: f.path.split('/').pop(),
             status: 'pending',
-            size: 0
+            size: 0,
+            attempts: 0,
+            lastPass: 0
         }));
+
+        const generatedMap = new Map(); // path -> content
 
         await updateProgress({
             stage: 'planned',
@@ -532,110 +551,179 @@ async function main() {
             pluginName: plan.pluginName,
             complexity: plan.complexity,
             files: fileList,
-            currentFile: null
+            currentFile: null,
+            pass: 1
         });
 
-        // Step 2: Generate each file
-        const generatedFiles = [];
-        const MAX_FILE_RETRIES = 2;
+        // ═══ MULTI-PASS GENERATION ═══
+        const MAX_FILE_RETRIES = 2;   // Retries per file per pass
+        const MAX_PASSES = 3;          // Total passes for skipped files
 
-        for (let i = 0; i < plan.files.length; i++) {
-            const file = plan.files[i];
+        for (let pass = 1; pass <= MAX_PASSES; pass++) {
+            const filesToDo = fileList.filter(f => f.status === 'pending' || f.status === 'skipped');
 
-            const filesState = fileList.map((f, idx) => ({
-                ...f,
-                status: idx < i ? 'completed' : (idx === i ? 'generating' : 'pending')
-            }));
-
-            await updateProgress({
-                stage: 'generating',
-                currentStep: i + 1,
-                totalSteps: plan.files.length,
-                files: filesState,
-                currentFile: file.path
-            });
-
-            let success = false;
-            let lastError = null;
-
-            for (let attempt = 0; attempt <= MAX_FILE_RETRIES && !success; attempt++) {
-                try {
-                    if (attempt > 0) {
-                        console.log(`  Retry ${attempt}/${MAX_FILE_RETRIES} for ${file.path}`);
-                        await new Promise(r => setTimeout(r, 3000));
-                    }
-
-                    const content = await generateFile(file, plan, generatedFiles);
-                    generatedFiles.push({ path: file.path, content });
-                    success = true;
-
-                    const updatedFiles = fileList.map((f, idx) => ({
-                        ...f,
-                        status: idx <= i ? 'completed' : 'pending',
-                        size: idx === i ? content.length : f.size
-                    }));
-
-                    await updateProgress({
-                        stage: 'generating',
-                        currentStep: i + 1,
-                        totalSteps: plan.files.length,
-                        files: updatedFiles,
-                        currentFile: null
-                    });
-                } catch (err) {
-                    lastError = err;
-                    console.error(`  Attempt ${attempt + 1} failed:`, err.message);
-                }
+            if (filesToDo.length === 0) {
+                console.log(`\nAll files complete after pass ${pass - 1}`);
+                break;
             }
 
-            if (!success) {
-                console.error(`File ${file.path} failed after ${MAX_FILE_RETRIES + 1} attempts`);
+            console.log(`\n═══ PASS ${pass}/${MAX_PASSES} ═══`);
+            console.log(`${filesToDo.length} files remaining`);
 
-                const failedFiles = fileList.map((f, idx) => ({
-                    ...f,
-                    status: idx === i ? 'failed' : (idx < i ? 'completed' : 'pending')
-                }));
+            for (let i = 0; i < fileList.length; i++) {
+                const fileEntry = fileList[i];
+
+                // Skip already completed files
+                if (fileEntry.status === 'completed') continue;
+                // Skip files failed permanently
+                if (fileEntry.status === 'failed') continue;
+
+                const fileDef = plan.files.find(f => f.path === fileEntry.path);
+                if (!fileDef) continue;
+
+                // Update: generating
+                setFileStatus(fileList, fileEntry.path, 'generating');
 
                 await updateProgress({
-                    stage: 'failed',
+                    stage: 'generating',
                     currentStep: i + 1,
                     totalSteps: plan.files.length,
-                    files: failedFiles,
-                    error: `Failed to generate ${file.path}: ${lastError?.message}`
+                    files: fileList,
+                    currentFile: fileEntry.path,
+                    pass: pass,
+                    message: pass > 1 ? `Retry pass ${pass}` : null
                 });
 
-                throw lastError;
+                let success = false;
+                let lastError = null;
+
+                for (let attempt = 0; attempt <= MAX_FILE_RETRIES && !success; attempt++) {
+                    try {
+                        if (attempt > 0) {
+                            console.log(`  Retry ${attempt}/${MAX_FILE_RETRIES} for ${fileEntry.path}`);
+                            await new Promise(r => setTimeout(r, 3000));
+                        }
+
+                        const content = await generateFile(fileDef, plan, Array.from(generatedMap.values()));
+                        generatedMap.set(fileEntry.path, content);
+                        success = true;
+                        setFileStatus(fileList, fileEntry.path, 'completed', content.length);
+
+                        await updateProgress({
+                            stage: 'generating',
+                            currentStep: i + 1,
+                            totalSteps: plan.files.length,
+                            files: fileList,
+                            currentFile: null,
+                            pass: pass
+                        });
+                    } catch (err) {
+                        lastError = err;
+                        console.error(`  Attempt ${attempt + 1} failed:`, err.message);
+                    }
+                }
+
+                if (!success) {
+                    fileEntry.attempts = (fileEntry.attempts || 0) + 1;
+                    fileEntry.lastPass = pass;
+
+                    if (pass >= MAX_PASSES) {
+                        // Permanent failure — no more passes
+                        setFileStatus(fileList, fileEntry.path, 'failed');
+
+                        await updateProgress({
+                            stage: 'generating',
+                            currentStep: i + 1,
+                            totalSteps: plan.files.length,
+                            files: fileList,
+                            currentFile: null,
+                            pass: pass,
+                            message: `Failed permanently: ${fileEntry.name}`
+                        });
+
+                        console.warn(`File ${fileEntry.path} FAILED permanently (all passes exhausted)`);
+                    } else {
+                        // Temporary skip — retry in next pass
+                        setFileStatus(fileList, fileEntry.path, 'skipped');
+
+                        await updateProgress({
+                            stage: 'generating',
+                            currentStep: i + 1,
+                            totalSteps: plan.files.length,
+                            files: fileList,
+                            currentFile: null,
+                            pass: pass,
+                            message: `Skipped ${fileEntry.name} — will retry in pass ${pass + 1}`
+                        });
+
+                        console.warn(`File ${fileEntry.path} SKIPPED — will retry in pass ${pass + 1}`);
+                    }
+
+                    // Small delay before next file
+                    await new Promise(r => setTimeout(r, 2000));
+                }
             }
         }
 
-        // Step 3: Finalize
+        // ═══ CHECK FINAL STATUS ═══
+        const failedFiles = fileList.filter(f => f.status === 'failed');
+        const skippedFiles = fileList.filter(f => f.status === 'skipped');
+        const completedFiles = fileList.filter(f => f.status === 'completed');
+
+        console.log(`\n═══ RESULTS ═══`);
+        console.log(`Completed: ${completedFiles.length}/${fileList.length}`);
+        console.log(`Skipped: ${skippedFiles.length}`);
+        console.log(`Failed: ${failedFiles.length}`);
+
+        // ═══ FINALIZE ═══
         await updateProgress({
             stage: 'finalizing',
             currentStep: plan.files.length,
             totalSteps: plan.files.length,
-            files: fileList.map(f => ({ ...f, status: 'completed' })),
-            currentFile: 'Assembling final package'
+            files: fileList,
+            currentFile: 'Assembling final package',
+            pass: MAX_PASSES
         });
 
-        const fileOutput = generatedFiles.map(f =>
-            `<file: ${f.path}>\n${f.content}\n</file>`
-        ).join('\n\n');
+        // Build output from all completed files
+        const fileOutput = [];
+        for (const fileEntry of fileList) {
+            if (fileEntry.status === 'completed' && generatedMap.has(fileEntry.path)) {
+                fileOutput.push(`<file: ${fileEntry.path}>\n${generatedMap.get(fileEntry.path)}\n</file>`);
+            }
+        }
 
         const finalOutput = `---
 EXPLANATION: ${plan.description || 'Plugin generated successfully'}
 PLUGIN_NAME: ${plan.pluginName}
-${fileOutput}
+${fileOutput.join('\n\n')}
 ---`;
 
         fs.writeFileSync('ai-result.txt', finalOutput, 'utf-8');
-        console.log(`\nAll ${generatedFiles.length} files generated (${finalOutput.length} chars)`);
+        console.log(`\nSaved ${finalOutput.length} chars to ai-result.txt`);
+
+        // ═══ MARK JOB STATUS ═══
+        if (failedFiles.length > 0) {
+            // Some files couldn't be generated — mark as failed
+            const errorMsg = `Could not generate ${failedFiles.length} file(s): ${failedFiles.map(f => f.name).join(', ')}`;
+            await updateProgress({
+                stage: 'failed',
+                currentStep: plan.files.length,
+                totalSteps: plan.files.length,
+                files: fileList,
+                error: errorMsg,
+                pass: MAX_PASSES
+            });
+            throw new Error(errorMsg);
+        }
 
         await updateProgress({
             stage: 'completed',
             currentStep: plan.files.length,
             totalSteps: plan.files.length,
-            files: fileList.map(f => ({ ...f, status: 'completed' })),
-            currentFile: null
+            files: fileList,
+            currentFile: null,
+            pass: MAX_PASSES
         });
 
     } catch (err) {
