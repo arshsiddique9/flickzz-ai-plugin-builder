@@ -13,6 +13,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # 🔧 CRITICAL: API keys for auto-fixer (scripts/auto-fix.js)
+      DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
+      NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
+      UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
+      TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -38,47 +49,62 @@ jobs:
           fi
           unzip -q source.zip && rm source.zip
           echo "✅ Source extracted"
+          echo "Files extracted:"
+          find . -type f | head -30
 
-      - name: Build with Maven (with Auto-Fix)
+      - name: Build with Maven (with Auto-Fix Loop)
         id: build_step
         run: |
           cd plugin-src
           set +e
-          
+
+          BUILD_SUCCESS=false
+
           for attempt in 1 2 3; do
             echo "═══════════════════════════════════════════"
             echo "BUILD ATTEMPT $attempt"
             echo "═══════════════════════════════════════════"
-            
+
             mvn -B clean package -DskipTests > build.log 2>&1
             MVN_EXIT=$?
-            
+
             if [ $MVN_EXIT -eq 0 ]; then
               echo "✅ Build successful on attempt $attempt"
+              BUILD_SUCCESS=true
               break
             fi
-            
+
             echo "❌ Build failed on attempt $attempt"
-            
+            echo "Last 20 lines of build.log:"
+            tail -20 build.log
+
             if [ $attempt -eq 3 ]; then
               echo "❌ Max attempts reached. Build failed permanently."
-              cat build.log
-              exit 1
+              break
             fi
-            
-            echo "🤖 Triggering AI Auto-Fix..."
+
+            echo ""
+            echo "🤖 Triggering AI Auto-Fix (attempt $attempt)..."
+
             node ../scripts/auto-fix.js
-            
-            if [ $? -ne 0 ]; then
-              echo "❌ Auto-Fix failed to run. Aborting."
-              exit 1
+            FIX_EXIT=$?
+
+            if [ $FIX_EXIT -ne 0 ]; then
+              echo "❌ Auto-Fix failed to run (exit code $FIX_EXIT). Aborting."
+              break
             fi
-            
-            echo "🔄 Retrying Maven build..."
+
+            echo "✅ Auto-Fix completed. Retrying Maven build..."
+            echo ""
           done
-          
+
           set -e
-          
+
+          if [ "$BUILD_SUCCESS" != "true" ]; then
+            echo "❌ Build did not succeed after all attempts."
+            exit 1
+          fi
+
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
           if [ -z "$JAR_FILE" ]; then
             echo "❌ No JAR found!"
@@ -111,7 +137,8 @@ jobs:
       - name: Notify Backend (Failure)
         if: failure()
         run: |
-          ERROR_MSG=$(tail -c 2000 plugin-src/build.log | tr '\n' '|' | sed 's/"/\\"/g')
+          cd plugin-src
+          ERROR_MSG=$(tail -c 2000 build.log | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
