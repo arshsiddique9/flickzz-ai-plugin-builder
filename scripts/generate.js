@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Smart Chunked Generation Engine
-// Dynamic file count, retry logic, context optimization
+// FlickZZ Builder — Smart Chunked Generation Engine (v2)
+// Fixed: HTML responses, JSON parsing, fallback plan
 // ============================================
 
 const fs = require('fs');
@@ -32,7 +32,7 @@ async function updateProgress(updates) {
     };
 
     try {
-        const res = await fetch(`${SUPABASE_URL}/rest/v1/ai_jobs?id=eq.${JOB_ID}`, {
+        await fetch(`${SUPABASE_URL}/rest/v1/ai_jobs?id=eq.${JOB_ID}`, {
             method: 'PATCH',
             headers: {
                 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
@@ -49,7 +49,31 @@ async function updateProgress(updates) {
 }
 
 // ═══════════════════════════════════════════
-// AI PROVIDER — with retry & fallback
+// 🔧 CONTENT VALIDATION — Reject HTML/errors
+// ═══════════════════════════════════════════
+function isValidContent(content) {
+    if (!content || typeof content !== 'string') return false;
+    const trimmed = content.trim();
+    if (trimmed.length === 0) return false;
+
+    // Reject HTML responses (Cloudflare error pages, etc.)
+    if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html') || trimmed.startsWith('<HTML')) {
+        return false;
+    }
+
+    // Reject Cloudflare/error JSON envelopes
+    if (trimmed.startsWith('{') && /"(error|errors|message)".*"(rate|limit|unavailable|forbidden|not found|model_)/i.test(trimmed.substring(0, 300))) {
+        return false;
+    }
+
+    // Reject very short responses
+    if (trimmed.length < 20) return false;
+
+    return true;
+}
+
+// ═══════════════════════════════════════════
+// AI PROVIDER — with retry, fallback, validation
 // ═══════════════════════════════════════════
 async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
     const providers = [
@@ -63,13 +87,13 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
             name: 'Nara',
             url: 'https://router.bynara.id/v1/chat/completions',
             key: NARA_API_KEY,
-            models: ['nemotron-3-ultra-free', 'nemotron-3-super-free', 'laguna-s-2.1']
+            models: ['nemotron-3-super-free', 'laguna-s-2.1', 'nemotron-3-ultra-free']
         },
         {
             name: 'OpenRouter',
             url: 'https://openrouter.ai/api/v1/chat/completions',
             key: OPENROUTER_API_KEY,
-            models: ['nvidia/nemotron-3-ultra-550b-a55b:free', 'qwen/qwen3-coder:free', 'openai/gpt-oss-120b:free'],
+            models: ['qwen/qwen3-coder:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'openai/gpt-oss-120b:free'],
             extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' }
         }
     ];
@@ -114,7 +138,15 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
                     clearTimeout(timeoutId);
 
                     if (!res.ok) {
-                        console.log(`  ${res.status}: ${(await res.text()).substring(0, 80)}`);
+                        const errText = await res.text();
+                        console.log(`  ${res.status}: ${errText.substring(0, 80)}`);
+                        continue;
+                    }
+
+                    // 🔧 Check content-type to reject HTML
+                    const contentType = res.headers.get('content-type') || '';
+                    if (!contentType.includes('application/json')) {
+                        console.log(`  Invalid content-type: ${contentType}`);
                         continue;
                     }
 
@@ -122,8 +154,9 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
                     const content = data.choices?.[0]?.message?.content || '';
                     const finishReason = data.choices?.[0]?.finish_reason || 'unknown';
 
-                    if (content.trim().length === 0) {
-                        console.log(`  Empty response, trying next...`);
+                    // 🔧 Validate content
+                    if (!isValidContent(content)) {
+                        console.log(`  Invalid/empty response (${content.length} chars), trying next...`);
                         continue;
                     }
 
@@ -146,7 +179,76 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
 }
 
 // ═══════════════════════════════════════════
-// PLANNING PHASE — Dynamic file count
+// 🔧 ROBUST JSON EXTRACTOR
+// ═══════════════════════════════════════════
+function extractJSON(text) {
+    if (!text) return null;
+
+    let json = text.trim();
+
+    // Remove BOM
+    json = json.replace(/^\uFEFF/, '');
+
+    // Remove markdown fences
+    json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '');
+
+    // Remove thinking tags
+    json = json.replace(/<think>[\s\S]*?<\/think>/gi, '');
+    json = json.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+
+    // Find the JSON boundaries
+    const startIdx = json.indexOf('{');
+    const endIdx = json.lastIndexOf('}');
+
+    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+        return null;
+    }
+
+    json = json.substring(startIdx, endIdx + 1);
+
+    // Try parsing
+    try {
+        return JSON.parse(json);
+    } catch (err) {
+        console.log(`  JSON parse failed: ${err.message}`);
+
+        // Clean up common issues
+        json = json
+            .replace(/,\s*}/g, '}')
+            .replace(/,\s*]/g, ']')
+            .replace(/\/\/[^\n]*/g, '')  // Remove // comments
+            .replace(/\/\*[\s\S]*?\*\//g, '');  // Remove /* */ comments
+
+        try {
+            return JSON.parse(json);
+        } catch (retryErr) {
+            console.log(`  JSON parse failed after cleanup: ${retryErr.message}`);
+            console.log(`  Preview: ${json.substring(0, 300)}`);
+            return null;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════
+// 🔧 FALLBACK PLAN — If AI planning fails
+// ═══════════════════════════════════════════
+function getFallbackPlan(pluginName = 'GeneratedPlugin') {
+    const pkg = 'com.flickzz.generated';
+    return {
+        pluginName: pluginName,
+        description: 'Auto-generated plugin',
+        complexity: 'medium',
+        files: [
+            { path: 'pom.xml', purpose: 'Maven build file' },
+            { path: 'src/main/resources/plugin.yml', purpose: 'Plugin manifest' },
+            { path: 'src/main/resources/config.yml', purpose: 'Plugin configuration' },
+            { path: `src/main/java/${pkg.replace(/\./g, '/')}/${pluginName}.java`, purpose: 'Main plugin class' }
+        ]
+    };
+}
+
+// ═══════════════════════════════════════════
+// PLANNING PHASE
 // ═══════════════════════════════════════════
 async function planPlugin(userPrompt) {
     console.log('\nPLANNING PHASE');
@@ -158,76 +260,59 @@ async function planPlugin(userPrompt) {
         currentFile: 'Analyzing your plugin request'
     });
 
-    const systemPrompt = `You are an expert Minecraft plugin architect. Analyze the user's request and decide the EXACT number of files needed. Output ONLY a JSON plan.
+    const systemPrompt = `You are a Minecraft plugin architect. Output ONLY a valid JSON plan.
 
-OUTPUT FORMAT (strict JSON, no other text, no markdown):
-{
-  "pluginName": "PluginName",
-  "description": "1-line description",
-  "complexity": "simple" | "medium" | "complex" | "framework",
-  "files": [
-    {"path": "pom.xml", "purpose": "Maven build file"},
-    {"path": "src/main/resources/plugin.yml", "purpose": "Plugin manifest"},
-    {"path": "src/main/resources/config.yml", "purpose": "Config with defaults"},
-    {"path": "src/main/java/com/flickzz/generated/PluginName.java", "purpose": "Main class"}
-  ]
-}
+🚨 CRITICAL OUTPUT RULES:
+- Output ONLY the JSON object. Nothing else.
+- Start with { and end with }.
+- NO markdown. NO \`\`\`. NO explanation. NO commentary.
+- NO thinking tags.
+- Make sure JSON is valid (no trailing commas, proper quotes).
 
-═══════════════════════════════════════════
-DECISION RULES (FOLLOW STRICTLY)
-═══════════════════════════════════════════
-Decide file count based on plugin complexity. DO NOT use a fixed number.
+OUTPUT FORMAT:
+{"pluginName":"FlickZZHomes","description":"Short description","complexity":"simple|medium|complex|framework","files":[{"path":"pom.xml","purpose":"Maven build file"},{"path":"src/main/resources/plugin.yml","purpose":"Plugin manifest"},{"path":"src/main/resources/config.yml","purpose":"Config"},{"path":"src/main/java/com/flickzz/generated/FlickZZHomes.java","purpose":"Main class"}]}
 
-SIMPLE (4-5 files):
-- 1-2 commands, no GUI, no events
-- Example: /spawn plugin
-- Files: pom.xml, plugin.yml, config.yml, Main.java
+FILE COUNT RULES (choose based on complexity):
+- Simple (1-2 commands): 4-5 files
+- Medium (3-5 commands): 6-9 files
+- Complex (GUI, admin, events): 10-18 files
+- Framework (multi-system): 18-35 files
 
-MEDIUM (6-9 files):
-- 3-5 commands, basic logic, maybe config
-- Example: /sethome /home plugin with cooldown
-- Files: pom.xml, plugin.yml, config.yml, Main.java, Manager.java, Data.java
+REQUIRED FILES (ALWAYS include):
+1. pom.xml
+2. src/main/resources/plugin.yml
+3. src/main/resources/config.yml (if configurable)
+4. Main class (JavaPlugin subclass) — MUST be FIRST Java file
 
-COMPLEX (10-18 files):
-- GUI, multiple commands, events, admin commands, permissions
-- Example: multi-home with GUI, warmup, particles
-- Files: pom.xml, plugin.yml, config.yml, Main.java, Manager.java, Data.java, GUI.java, Command.java, Listener.java, Utils.java
+STANDARDS:
+- Paper API 1.21.1, Java 21
+- Package: com.flickzz.generated
+- Each file = ONE clear purpose
 
-FRAMEWORK (18-35 files):
-- Multiple systems, economy, shop, GUI menus, API, events
-- Example: SkyBlock core plugin
-- Files: many more (break into subsystems)
+Output ONLY the JSON object now. Start with {`;
 
-═══════════════════════════════════════════
-CRITICAL RULES
-═══════════════════════════════════════════
-1. Main Java class file MUST be the FIRST Java file (after pom, plugin.yml, config.yml)
-2. ALL Java files use package: com.flickzz.generated
-3. Paper API 1.21.1, Java 21
-4. Each file must have ONE clear responsibility (SRP)
-5. Think about what's really needed:
-   - If GUI requested → include a GUI class
-   - If many commands → include a Command executor
-   - If events needed → include a Listener
-   - If config/data → include a Manager
-   - If data models → include model classes
-6. Don't create unnecessary files. Only what's needed.
-7. Output ONLY the JSON. No markdown. No explanation.`;
-
-    const result = await callAI(systemPrompt, userPrompt, 2000);
-    if (!result.ok) throw new Error('Planning failed');
-
-    let json = result.content.trim();
-    if (json.startsWith('```')) {
-        json = json.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    const result = await callAI(systemPrompt, userPrompt, 3000);
+    
+    if (!result.ok) {
+        console.log('  All providers failed for planning, using fallback plan');
+        return getFallbackPlan();
     }
 
-    const startIdx = json.indexOf('{');
-    const endIdx = json.lastIndexOf('}');
-    if (startIdx === -1 || endIdx === -1) throw new Error('Invalid plan JSON');
+    const plan = extractJSON(result.content);
+    
+    if (!plan || !plan.files || !Array.isArray(plan.files) || plan.files.length === 0) {
+        console.log('  Invalid plan from AI, using fallback plan');
+        console.log(`  Raw response preview: ${result.content.substring(0, 500)}`);
+        return getFallbackPlan();
+    }
 
-    const plan = JSON.parse(json.substring(startIdx, endIdx + 1));
-    if (!plan.files || plan.files.length === 0) throw new Error('No files in plan');
+    // Ensure pluginName exists
+    if (!plan.pluginName) {
+        plan.pluginName = 'GeneratedPlugin';
+    }
+
+    // Sanitize pluginName (only alphanumeric)
+    plan.pluginName = plan.pluginName.replace(/[^a-zA-Z0-9]/g, '');
 
     console.log(`Planned ${plan.files.length} files [${plan.complexity || 'unknown'}]:`);
     plan.files.forEach((f, i) => console.log(`  ${i + 1}. ${f.path}`));
@@ -235,27 +320,22 @@ CRITICAL RULES
 }
 
 // ═══════════════════════════════════════════
-// SMART CONTEXT — Only include relevant files
+// SMART CONTEXT
 // ═══════════════════════════════════════════
 function buildContext(file, alreadyGenerated, plan) {
     if (alreadyGenerated.length === 0) return '';
 
-    // For config files (pom, plugin.yml, config.yml) — no context needed
     if (file.path.endsWith('.xml') || file.path.endsWith('.yml') || file.path.endsWith('.yaml')) {
-        return '\n\n(No context files needed - this is a resource file)';
+        return '\n\n(No context files needed - resource file)';
     }
 
-    // For Main class — no context needed (it's the first Java file)
     const isMainClass = file.path.endsWith(`/${plan.pluginName}.java`);
     if (isMainClass) {
-        return '\n\n(No context files needed - this is the main entry point)';
+        return '\n\n(No context needed - main entry point)';
     }
 
-    // For other Java files — include Main class + related classes
     const relevantFiles = alreadyGenerated.filter(f => {
-        // Always include Main class
         if (f.path.endsWith(`/${plan.pluginName}.java`)) return true;
-        // Include the immediately previous file for continuity
         const idx = alreadyGenerated.indexOf(f);
         return idx >= alreadyGenerated.length - 2;
     });
@@ -266,11 +346,7 @@ function buildContext(file, alreadyGenerated, plan) {
         `### ${f.path}\n${f.content}`
     ).join('\n\n');
 
-    return `\n\n═══════════════════════════════════════════
-RELEVANT CONTEXT (from already generated files)
-═══════════════════════════════════════════
-${contextStr}
-═══════════════════════════════════════════`;
+    return `\n\n═══ RELEVANT CONTEXT ═══\n${contextStr}\n════════════════════════`;
 }
 
 // ═══════════════════════════════════════════
@@ -280,57 +356,43 @@ async function generateFile(file, plan, alreadyGenerated) {
     console.log(`\nGenerating: ${file.path}`);
 
     const filesContext = buildContext(file, alreadyGenerated, plan);
-
     const isResource = file.path.endsWith('.xml') || file.path.endsWith('.yml') || file.path.endsWith('.yaml');
 
     const systemPrompt = `You are an expert Java Bukkit/Paper plugin developer. Generate ONE complete file.
 
-═══════════════════════════════════════════
-FILE INFO
-═══════════════════════════════════════════
-Plugin Name: ${plan.pluginName}
-File Path: ${file.path}
-Purpose: ${file.purpose}
-Package: com.flickzz.generated
-Paper API: 1.21.1
-Java: 21
-File Type: ${isResource ? 'Resource (XML/YAML)' : 'Java Class'}
+FILE INFO:
+- Plugin: ${plan.pluginName}
+- Path: ${file.path}
+- Purpose: ${file.purpose}
+- Package: com.flickzz.generated
+- Paper API: 1.21.1, Java 21
+- Type: ${isResource ? 'Resource' : 'Java Class'}
 ${filesContext}
 
-═══════════════════════════════════════════
-CRITICAL RULES
-═══════════════════════════════════════════
-1. Output ONLY the raw file content. NO markdown. NO \`\`\`. NO explanation.
-2. Use LITERAL < and > characters (never escape them)
-3. Include ALL necessary imports at the top (Java files)
-4. Package MUST be exactly: com.flickzz.generated
-5. For Java: import EVERY class you reference
-6. For pom.xml: Paper API 1.21.1-R0.1-SNAPSHOT, Java 21, maven-compiler-plugin 3.13.0
-7. For plugin.yml: api-version: '1.21', include all commands + permissions
-8. For config.yml: include ALL messages with & color codes
-9. Verify every method exists in Bukkit/Paper API 1.21.1
-10. Add null checks, instanceof checks, try-catch where needed
+CRITICAL RULES:
+1. Output ONLY the raw file content. NO markdown, NO \`\`\`, NO explanation.
+2. Use LITERAL < and > characters (never escape)
+3. Include ALL imports at the top (Java files)
+4. Package: com.flickzz.generated
+5. Import EVERY class you reference
+6. pom.xml → Paper API 1.21.1-R0.1-SNAPSHOT, Java 21, maven-compiler-plugin 3.13.0
+7. plugin.yml → api-version: '1.21', all commands + permissions
+8. config.yml → all messages with & color codes
+9. Verify methods exist in Bukkit/Paper API
+10. Add null checks, instanceof checks, try-catch
 
-═══════════════════════════════════════════
-COMMON MISTAKES (AVOID THESE)
-═══════════════════════════════════════════
-- Missing imports → import EVERYTHING you use
-- inventory.getTitle() → use event.getView().getTitle() instead
-- (Player) sender without instanceof check → ALWAYS check
-- File.createNewFile() without try-catch → wrap in try-catch
-- Sound.valueOf() / Particle.valueOf() without try-catch → wrap
-- Private methods called from another class → make public
-- Using classes not imported → ALWAYS import
-- Wrong package → must be com.flickzz.generated
-- Bukkit.getWorld() without null check → check for null
+COMMON MISTAKES (AVOID):
+- Missing imports
+- inventory.getTitle() → event.getView().getTitle()
+- (Player) sender without instanceof
+- File.createNewFile() without try-catch
+- Sound.valueOf() / Particle.valueOf() without try-catch
+- Private methods called from another class
+- Wrong package
+- Bukkit.getWorld() without null check
+- getCommand("x") without null check
 
-═══════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════
-Output ONLY the file content. Start immediately with the first line of the file.
-NO preamble. NO "here is the file". NO markdown fences.
-
-Begin now.`;
+Output ONLY the file content. Start immediately. NO preamble.`;
 
     const result = await callAI(systemPrompt, `Generate the complete file: ${file.path}`, 6000);
     if (!result.ok) throw new Error(`Failed to generate ${file.path}`);
@@ -340,11 +402,10 @@ Begin now.`;
     // Clean up AI artifacts
     content = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
     content = content.replace(/^\/\/\s*(File:|Path:|Here is|This is).*\n/i, '');
-    content = content.replace(/^(Here is|This is)[^\n]*\n+/i, '');
+    content = content.replace(/^(Here is|This is|Sure|Okay|Alright)[^\n]*\n+/i, '');
 
-    // Remove any trailing explanation
+    // For Java files, trim to last closing brace
     if (!isResource) {
-        // For Java files, ensure it ends with closing brace
         const lastBrace = content.lastIndexOf('}');
         if (lastBrace > 0 && lastBrace < content.length - 50) {
             content = content.substring(0, lastBrace + 1);
@@ -360,38 +421,43 @@ Begin now.`;
 }
 
 // ═══════════════════════════════════════════
-// CHAT/DISCUSSION MODE
+// CHAT MODE
 // ═══════════════════════════════════════════
 async function handleChat(userPrompt) {
     console.log('\nCHAT MODE');
 
     const systemPrompt = `You are FlickZZ Builder AI — the official AI assistant of FlickZZ Resources, created by Arsh Siddique.
 
-IDENTITY (NEVER BREAK):
-- Your name: FlickZZ Builder AI
+IDENTITY:
+- Name: FlickZZ Builder AI
 - Creator: Arsh Siddique (FlickZZ Resources)
-- Platform: FlickZZ Resources (flickzz.qzz.io)
 - NEVER mention: OpenAI, Anthropic, Claude, GPT, Gemini, or any real AI company
 - If asked "who made you?" → "Main FlickZZ Builder AI hoon, Arsh Siddique ne banaya hai."
 
 BEHAVIOR:
 - Reply in user's language (Hindi/Hinglish/English)
-- For greetings: be friendly and brief
-- For questions: explain clearly
-- If user wants a plugin → tell them to describe it and you'll build it
-- Keep responses concise (under 200 words for chat)`;
+- Keep responses short (under 100 words)
+- Do NOT use any thinking tags or internal monologue
+- Reply directly`;
 
     const result = await callAI(systemPrompt, userPrompt, 1500);
     if (!result.ok) throw new Error('Chat failed');
 
-    return result.content;
+    // Strip thinking tags from chat too
+    let response = result.content;
+    response = response.replace(/<think>[\s\S]*?<\/think>/gi, '');
+    response = response.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+    response = response.replace(/<\/?think>/gi, '').trim();
+
+    return response;
 }
 
 // ═══════════════════════════════════════════
-// VALIDATION — Ensure required files exist
+// VALIDATION
 // ═══════════════════════════════════════════
 function validatePlan(plan) {
     const paths = plan.files.map(f => f.path.toLowerCase());
+    const pkg = 'com.flickzz.generated';
 
     const hasPom = paths.some(p => p.includes('pom.xml'));
     const hasPluginYml = paths.some(p => p.includes('plugin.yml'));
@@ -405,7 +471,7 @@ function validatePlan(plan) {
 
     if (missing.length > 0) {
         console.log(`Auto-fixing missing files: ${missing.join(', ')}`);
-        // Prepend missing files
+        
         if (!hasPom) {
             plan.files.unshift({ path: 'pom.xml', purpose: 'Maven build file' });
         }
@@ -415,7 +481,14 @@ function validatePlan(plan) {
         }
         if (!hasConfigYml) {
             const idx = plan.files.findIndex(f => f.path.includes('plugin.yml'));
-            plan.files.splice(idx + 1, 0, { path: 'src/main/resources/config.yml', purpose: 'Configuration file' });
+            plan.files.splice(idx + 1, 0, { path: 'src/main/resources/config.yml', purpose: 'Configuration' });
+        }
+        if (!hasMainClass) {
+            const idx = plan.files.findIndex(f => f.path.includes('config.yml'));
+            plan.files.splice(idx + 1, 0, { 
+                path: `src/main/java/${pkg.replace(/\./g, '/')}/${plan.pluginName}.java`, 
+                purpose: 'Main plugin class' 
+            });
         }
     }
 
@@ -444,7 +517,7 @@ async function main() {
         let plan = await planPlugin(USER_PROMPT);
         plan = validatePlan(plan);
 
-        // Initialize progress with file list
+        // Initialize progress
         const fileList = plan.files.map(f => ({
             path: f.path,
             name: f.path.split('/').pop(),
@@ -462,7 +535,7 @@ async function main() {
             currentFile: null
         });
 
-        // Step 2: Generate each file sequentially with retry
+        // Step 2: Generate each file
         const generatedFiles = [];
         const MAX_FILE_RETRIES = 2;
 
