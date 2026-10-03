@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Multi-Pass Generation Engine (v4)
-// File skip + retry passes + model health + timing
+// FlickZZ Builder — Multi-Pass Generation Engine (v5)
+// FIXED: generatedMap context bug + Dahl timeout
 // ============================================
 
 const fs = require('fs');
@@ -149,7 +149,8 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
                     };
 
                     const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 240000);
+                    // 🔧 FIX: Dahl timeout 240s → 90s (Dahl 524 error jaldi detect karo, next model try karo)
+                    const timeoutId = setTimeout(() => controller.abort(), 90000);
 
                     const res = await fetch(provider.url, {
                         method: 'POST',
@@ -341,9 +342,10 @@ Output ONLY the JSON object now.`;
 
 // ═══════════════════════════════════════════
 // SMART CONTEXT
+// 🔧 FIXED: Handle both string and object types safely
 // ═══════════════════════════════════════════
 function buildContext(file, alreadyGenerated, plan) {
-    if (alreadyGenerated.length === 0) return '';
+    if (!alreadyGenerated || alreadyGenerated.length === 0) return '';
 
     if (file.path.endsWith('.xml') || file.path.endsWith('.yml') || file.path.endsWith('.yaml')) {
         return '\n\n(No context files needed - resource file)';
@@ -354,17 +356,28 @@ function buildContext(file, alreadyGenerated, plan) {
         return '\n\n(No context needed - main entry point)';
     }
 
-    const relevantFiles = alreadyGenerated.filter(f => {
-        if (f.path.endsWith(`/${plan.pluginName}.java`)) return true;
+    // 🔧 FIX: Safely filter — handle both string and object entries
+    const relevantFiles = alreadyGenerated.filter((f) => {
+        const filePath = (typeof f === 'string') ? f : (f && f.path ? f.path : '');
+        if (!filePath) return false;
+
+        if (filePath.endsWith(`/${plan.pluginName}.java`)) return true;
+
         const idx = alreadyGenerated.indexOf(f);
         return idx >= alreadyGenerated.length - 2;
     });
 
     if (relevantFiles.length === 0) return '';
 
-    const contextStr = relevantFiles.map(f =>
-        `### ${f.path}\n${f.content}`
-    ).join('\n\n');
+    // 🔧 FIX: Safely format — handle both string and object entries
+    const contextStr = relevantFiles.map((f) => {
+        if (typeof f === 'string') {
+            return `### (content)\n${f}`;
+        }
+        const filePath = f.path || 'unknown';
+        const fileContent = f.content || '';
+        return `### ${filePath}\n${fileContent}`;
+    }).join('\n\n');
 
     return `\n\n═══ RELEVANT CONTEXT ═══\n${contextStr}\n════════════════════════`;
 }
@@ -499,7 +512,7 @@ function validatePlan(plan) {
 }
 
 // ═══════════════════════════════════════════
-// HELPER: Update file status with timing
+// HELPER: Update file status
 // ═══════════════════════════════════════════
 function setFileStatus(fileList, filePath, status, options = {}) {
     const file = fileList.find(f => f.path === filePath);
@@ -551,6 +564,7 @@ async function main() {
             model: null
         }));
 
+        // 🔧 FIX: Map will store OBJECTS with {path, content} instead of raw strings
         const generatedMap = new Map();
 
         await updateProgress({
@@ -588,7 +602,6 @@ async function main() {
                 const fileDef = plan.files.find(f => f.path === fileEntry.path);
                 if (!fileDef) continue;
 
-                // 🔧 Mark generation start time (only if not already started)
                 const fileStartTime = Date.now();
                 fileEntry.startedAt = fileStartTime;
                 fileEntry.attempts = (fileEntry.attempts || 0) + 1;
@@ -610,8 +623,6 @@ async function main() {
 
                 let success = false;
                 let lastError = null;
-                let usedProvider = null;
-                let usedModel = null;
 
                 for (let attempt = 0; attempt <= MAX_FILE_RETRIES && !success; attempt++) {
                     try {
@@ -620,13 +631,19 @@ async function main() {
                             await new Promise(r => setTimeout(r, 3000));
                         }
 
-                        const content = await generateFile(fileDef, plan, Array.from(generatedMap.values()));
-                        generatedMap.set(fileEntry.path, content);
+                        // 🔧 FIX: Pass proper objects array
+                        const contextFiles = Array.from(generatedMap.values());
+                        const content = await generateFile(fileDef, plan, contextFiles);
+
+                        // 🔧 CRITICAL FIX: Store as object {path, content} instead of raw string
+                        generatedMap.set(fileEntry.path, {
+                            path: fileEntry.path,
+                            content: content
+                        });
+
                         success = true;
 
-                        // 🔧 Calculate duration
                         const duration = Date.now() - fileStartTime;
-
                         fileEntry.duration = duration;
                         fileEntry.size = content.length;
 
@@ -716,10 +733,13 @@ async function main() {
             totalDuration: jobDuration
         });
 
+        // 🔧 FIX: Extract .content from the object
         const fileOutput = [];
         for (const fileEntry of fileList) {
             if (fileEntry.status === 'completed' && generatedMap.has(fileEntry.path)) {
-                fileOutput.push(`<file: ${fileEntry.path}>\n${generatedMap.get(fileEntry.path)}\n</file>`);
+                const fileData = generatedMap.get(fileEntry.path);
+                const content = (typeof fileData === 'string') ? fileData : fileData.content;
+                fileOutput.push(`<file: ${fileEntry.path}>\n${content}\n</file>`);
             }
         }
 
