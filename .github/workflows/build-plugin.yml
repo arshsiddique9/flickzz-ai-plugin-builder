@@ -14,13 +14,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # 🔧 CRITICAL: API keys for auto-fixer (scripts/auto-fix.js)
+      # 🔧 Auto-Fixer API Keys
       DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
       NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
       UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
       TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      KILO_API_KEY: ${{ secrets.KILO_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
@@ -52,6 +54,21 @@ jobs:
           echo "Files extracted:"
           find . -type f | head -30
 
+      # 🆕 BUILD PROJECT CONTEXT (for auto-fixer to understand the project)
+      - name: Build Project Context
+        run: |
+          cd plugin-src
+          export USER_PROMPT="${{ github.event.inputs.plugin_name }}"
+          if [ -f "../scripts/build-context.js" ]; then
+            node ../scripts/build-context.js || echo "⚠️ Context generation skipped (non-fatal)"
+          else
+            echo "⚠️ build-context.js not found, skipping"
+          fi
+          if [ -f "project-context.json" ]; then
+            echo "✅ Project context generated:"
+            head -50 project-context.json
+          fi
+
       - name: Build with Maven (with Auto-Fix Loop)
         id: build_step
         run: |
@@ -75,8 +92,8 @@ jobs:
             fi
 
             echo "❌ Build failed on attempt $attempt"
-            echo "Last 20 lines of build.log:"
-            tail -20 build.log
+            echo "Last 30 lines of build.log:"
+            tail -30 build.log
 
             if [ $attempt -eq 3 ]; then
               echo "❌ Max attempts reached. Build failed permanently."
@@ -138,7 +155,11 @@ jobs:
         if: failure()
         run: |
           cd plugin-src
-          ERROR_MSG=$(tail -c 2000 build.log | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
+          if [ -f build.log ]; then
+            ERROR_MSG=$(tail -c 2000 build.log | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
+          else
+            ERROR_MSG="Build failed before Maven log was created"
+          fi
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
