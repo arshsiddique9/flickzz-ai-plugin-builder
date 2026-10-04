@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Auto-Fixer Script (v2)
-// FIXED: Strict prompt + fallback parser + AI response logging
+// FlickZZ Auto-Fixer Script (v3)
+// FIXED: If AI returns fewer files, keep original files for the rest
 // ============================================
 
 const fs = require('fs');
@@ -17,9 +17,8 @@ const PROJECT_DIR = process.cwd();
 const ERROR_LOG_FILE = path.join(PROJECT_DIR, 'build.log');
 
 console.log(`[Auto-Fix] Working directory: ${PROJECT_DIR}`);
-console.log(`[Auto-Fix] Build log: ${ERROR_LOG_FILE}`);
 
-// API Key availability check
+// API Key availability
 console.log('[Auto-Fix] API Key availability:');
 console.log(`  DAHL_API_KEY: ${DAHL_API_KEY ? 'SET' : 'MISSING'}`);
 console.log(`  NARA_API_KEY: ${NARA_API_KEY ? 'SET' : 'MISSING'}`);
@@ -69,12 +68,12 @@ function getAllProjectFiles() {
 }
 
 // ═══════════════════════════════════════════
-// 3. PARSE FILES FROM AI RESPONSE (with fallback)
+// 3. PARSE FILES FROM AI RESPONSE
 // ═══════════════════════════════════════════
 function parseFilesFromAI(text) {
     const files = [];
 
-    // Primary parser: <file: path> ... </file>
+    // Primary parser
     const parts = text.split(/<file:\s*/);
     parts.shift();
     for (const part of parts) {
@@ -87,23 +86,11 @@ function parseFilesFromAI(text) {
 
     if (files.length > 0) return files;
 
-    // Fallback parser: markdown code blocks with filename
-    console.log('[Auto-Fix] Primary parser failed. Trying markdown fallback...');
+    // Fallback: markdown code blocks
     const mdRegex = /```(?:java|xml|yaml|yml|json)?\s*\n\s*(?:\/\/|#)\s*([\w\-\.\/]+)\s*\n([\s\S]*?)```/gi;
     let m;
     while ((m = mdRegex.exec(text)) !== null) {
         files.push({ path: m[1].trim(), content: m[2].trim() });
-    }
-
-    if (files.length > 0) return files;
-
-    // Fallback 2: Just look for "path/to/file.java" followed by code block
-    const mdRegex2 = /```(?:java|xml|yaml|yml|json)?\s*\n([\s\S]*?)```/gi;
-    const paths = text.match(/[\w\/\-\.]+\.(?:java|xml|yml|yaml|json)/gi) || [];
-    let idx = 0;
-    while ((m = mdRegex2.exec(text)) !== null && idx < paths.length) {
-        files.push({ path: paths[idx].trim(), content: m[1].trim() });
-        idx++;
     }
 
     return files;
@@ -112,17 +99,18 @@ function parseFilesFromAI(text) {
 // ═══════════════════════════════════════════
 // 4. AI CALLER
 // ═══════════════════════════════════════════
-async function callBestAIModel(prompt) {
+async function callBestAIModel(prompt, originalFileCount) {
     const providers = [
         { name: 'Dahl', url: 'https://inference.dahl.global/v1/chat/completions', key: DAHL_API_KEY, model: 'MiniMaxAI/MiniMax-M2.7' },
+        { name: 'Dahl-DeepSeek', url: 'https://inference.dahl.global/v1/chat/completions', key: DAHL_API_KEY, model: 'deepseek-ai/DeepSeek-V4-Flash-0731' },
         { name: 'Nara', url: 'https://router.bynara.id/v1/chat/completions', key: NARA_API_KEY, model: 'nemotron-3-ultra-free' },
         { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: OPENROUTER_API_KEY, model: 'nvidia/nemotron-3-ultra-550b-a55b:free', extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' } },
-        { name: 'AgentRouter', url: 'https://agentrouter.org/v1/chat/completions', key: AGENTROUTER_API_KEY, model: 'claude-opus-4-8', extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' } },
         { name: 'UNOROUTER', url: 'https://api.unorouter.com/v1/chat/completions', key: UNOROUTER_API_KEY, model: 'nemotron-3-ultra-550b-a55b:free' },
         { name: 'TokenHarbor', url: 'https://api.tokenharbor.ai/v1/chat/completions', key: TOKENHARBOR_API_KEY, model: 'deepseek-v4.1-flash:free' }
     ];
 
     let attempted = 0;
+    let bestCandidate = null; // 🔧 Save best response even if incomplete
 
     for (const p of providers) {
         if (!p.key) {
@@ -167,20 +155,40 @@ async function callBestAIModel(prompt) {
             }
 
             console.log(`[Auto-Fix] ${p.name} returned ${text.length} chars`);
-            // 🔧 DEBUG: Show first 400 chars of AI response
-            console.log(`[Auto-Fix] Response preview: ${text.substring(0, 400).replace(/\n/g, ' ⏎ ')}...`);
 
             const files = parseFilesFromAI(text);
+            console.log(`[Auto-Fix] ${p.name} parsed ${files.length} files (original project has ${originalFileCount})`);
 
-            if (files.length > 0) {
-                console.log(`[Auto-Fix] ✅ ${p.name} returned ${files.length} parsed files!`);
+            if (files.length === 0) {
+                console.log(`[Auto-Fix] ${p.name} returned 0 parsed files. Trying next...`);
+                continue;
+            }
+
+            // 🔧 NEW: If we got ALL files, use immediately
+            if (files.length >= originalFileCount) {
+                console.log(`[Auto-Fix] ✅ ${p.name} returned ALL ${files.length} files!`);
                 files.forEach(f => console.log(`     - ${f.path}`));
                 return files;
             }
-            console.log(`[Auto-Fix] ${p.name} returned 0 parsed files. Trying next provider...`);
+
+            // 🔧 Save the largest response so far (even if not all files)
+            if (!bestCandidate || files.length > bestCandidate.files.length) {
+                bestCandidate = { provider: p.name, files };
+                console.log(`[Auto-Fix] 💾 Saved ${p.name}'s ${files.length} files as fallback candidate.`);
+            }
+
+            console.log(`[Auto-Fix] ${p.name} returned FEWER files (${files.length} < ${originalFileCount}). Trying next provider for complete fix...`);
         } catch (err) {
             console.error(`[Auto-Fix] ${p.name} exception:`, err.message);
         }
+    }
+
+    // 🔧 NEW: If no provider returned ALL files, use the best candidate we got
+    if (bestCandidate) {
+        console.log(`[Auto-Fix] ⚠️  No provider returned all ${originalFileCount} files.`);
+        console.log(`[Auto-Fix] Using best candidate: ${bestCandidate.provider} with ${bestCandidate.files.length} files.`);
+        console.log(`[Auto-Fix] Remaining ${originalFileCount - bestCandidate.files.length} files will keep their ORIGINAL content.`);
+        return bestCandidate.files;
     }
 
     throw new Error(`All ${attempted} AI providers failed`);
@@ -195,13 +203,12 @@ async function main() {
     const errorLog = getErrorLog();
     if (!errorLog) { console.log('[Auto-Fix] ❌ No error log.'); process.exit(1); }
 
-    const projectFiles = getAllProjectFiles();
-    console.log(`[Auto-Fix] Loaded ${projectFiles.length} project files.`);
-    if (projectFiles.length === 0) { console.log('[Auto-Fix] ❌ No project files.'); process.exit(1); }
+    const originalFiles = getAllProjectFiles();
+    console.log(`[Auto-Fix] Loaded ${originalFiles.length} original project files.`);
+    if (originalFiles.length === 0) { console.log('[Auto-Fix] ❌ No project files.'); process.exit(1); }
 
-    const fullFileList = projectFiles.map(f => `<file: ${f.path}>\n${f.content}\n</file>`).join('\n\n');
+    const fullFileList = originalFiles.map(f => `<file: ${f.path}>\n${f.content}\n</file>`).join('\n\n');
 
-    // 🔧 STRICTER PROMPT
     const repairPrompt = `You are an expert Java developer. A Minecraft Paper plugin failed to compile.
 Fix the errors and return the complete project.
 
@@ -211,54 +218,81 @@ BUILD ERROR LOG:
 ${errorLog}
 
 ═══════════════════════════════════════════
-CURRENT PROJECT FILES (all ${projectFiles.length} files):
+CURRENT PROJECT FILES (all ${originalFiles.length} files):
 ═══════════════════════════════════════════
 ${fullFileList}
 
 ═══════════════════════════════════════════
 INSTRUCTIONS (READ CAREFULLY):
 ═══════════════════════════════════════════
-1. Identify the errors from the error log. Common ones:
-   - "class, interface, enum, or record expected" → There is EXTRA content after the class closing brace. Delete everything after the last `}` of the main class.
-   - "cannot find symbol" → Add missing import at top of the file, OR create the missing class.
-   - "package does not exist" → Fix the import path.
+1. Identify and fix the errors from the error log:
+   - "';' expected" → Missing semicolon. Add it.
+   - "reached end of file while parsing" → Missing closing brace `}`. Add it.
+   - "class, interface, enum, or record expected" → Extra content after class. Delete it.
+   - "cannot find symbol" → Add missing import OR create the missing class.
+   - "package does not exist" → Fix import path.
+
 2. Fix ONLY the errors. Do NOT change working code.
-3. Return EVERY SINGLE FILE, even if you didn't change it.
 
-🚨 OUTPUT FORMAT — THIS IS CRITICAL:
-- You MUST output ONLY the files in the following format. Nothing else.
+3. 🚨 CRITICAL: You MUST return ALL ${originalFiles.length} files. Even the ones you didn't change.
+   If you return fewer files, the ones you don't return will KEEP their buggy state and the build will fail again.
+
+🚨 OUTPUT FORMAT — MANDATORY:
+- Output ONLY files in this format. NOTHING else.
 - NO explanations. NO markdown. NO \`\`\`.
-- Start each file with <file: path/to/file>
-- End each file with </file>
 
-EXAMPLE FORMAT:
-<file: src/main/java/com/flickzz/generated/FzWarps.java>
-package com.flickzz.generated;
-// ... code ...
+<file: path/to/file>
+content
 </file>
 
+EXAMPLE:
 <file: pom.xml>
 <?xml version="1.0"?>
-// ... code ...
+...
+</file>
+
+<file: src/main/java/com/flickzz/generated/FzWarps.java>
+package com.flickzz.generated;
+...
 </file>
 
 Paper API 1.21.1, Java 21, Package: com.flickzz.generated
 
-NOW OUTPUT ALL ${projectFiles.length} FILES. Start with <file: pom.xml>`;
+NOW OUTPUT ALL ${originalFiles.length} FILES. START NOW.`;
 
     try {
-        const fixedFiles = await callBestAIModel(repairPrompt);
-        console.log(`[Auto-Fix] Writing ${fixedFiles.length} fixed files...`);
+        const fixedFiles = await callBestAIModel(repairPrompt, originalFiles.length);
+
+        console.log(`[Auto-Fix] Received ${fixedFiles.length} fixed files from AI.`);
+        console.log(`[Auto-Fix] Writing files (original files NOT returned will keep their current content)...`);
+
+        // 🔧 NEW: Only overwrite files that AI returned. Others stay as-is.
+        const originalPaths = new Set(originalFiles.map(f => f.path));
+        let updatedCount = 0;
+        let newCount = 0;
 
         for (const file of fixedFiles) {
             const fullPath = path.join(PROJECT_DIR, file.path);
             const dir = path.dirname(fullPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+            const existed = originalPaths.has(file.path);
             fs.writeFileSync(fullPath, file.content, 'utf-8');
-            console.log(`  ✍️  Wrote ${file.path}`);
+
+            if (existed) {
+                updatedCount++;
+                console.log(`  ✍️  Updated: ${file.path}`);
+            } else {
+                newCount++;
+                console.log(`  ✨ Created (NEW): ${file.path}`);
+            }
         }
 
-        console.log('[Auto-Fix] ✅ All files written.');
+        console.log(`[Auto-Fix] ✅ Summary:`);
+        console.log(`     - ${updatedCount} files updated`);
+        console.log(`     - ${newCount} new files created`);
+        console.log(`     - ${originalFiles.length - updatedCount} files kept from original`);
+
     } catch (err) {
         console.error('[Auto-Fix] ❌ FATAL:', err.message);
         process.exit(1);
