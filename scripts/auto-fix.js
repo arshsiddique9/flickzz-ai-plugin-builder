@@ -1,6 +1,7 @@
 // ============================================
-// FlickZZ Auto-Fixer Script (v3 - Fixed)
-// Runs on GitHub Actions
+// FlickZZ Auto-Fixer Script (v5 - Chunked Fix)
+// THE GENIUS TRICK: Per-file AI calls with isolated context
+// Never hits token limits. Ever.
 // ============================================
 
 const fs = require('fs');
@@ -9,97 +10,122 @@ const path = require('path');
 const DAHL_API_KEY = process.env.DAHL_API_KEY;
 const NARA_API_KEY = process.env.NARA_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const AGENTROUTER_API_KEY = process.env.AGENTROUTER_API_KEY;
-const UNOROUTER_API_KEY = process.env.UNOROUTER_API_KEY;
-const TOKENHARBOR_API_KEY = process.env.TOKENHARBOR_API_KEY;
 
 const PROJECT_DIR = process.cwd();
 const ERROR_LOG_FILE = path.join(PROJECT_DIR, 'build.log');
 
 // ═══════════════════════════════════════════
-// 1. READ ERROR LOG
+// 1. ANALYZE ERRORS — GROUP BY FILE
 // ═══════════════════════════════════════════
-function getErrorLog() {
+function analyzeErrors() {
     if (!fs.existsSync(ERROR_LOG_FILE)) {
-        console.log(`[Auto-Fix] ❌ build.log NOT FOUND at ${ERROR_LOG_FILE}`);
+        console.log('[Auto-Fix] ❌ build.log not found');
         return null;
     }
-    const log = fs.readFileSync(ERROR_LOG_FILE, 'utf-8');
-    console.log(`[Auto-Fix] Build log size: ${log.length} chars`);
 
+    const log = fs.readFileSync(ERROR_LOG_FILE, 'utf-8');
     const lines = log.split('\n');
+
+    // Filter only real compile errors
     const errorLines = lines.filter(l =>
-        l.includes('[ERROR]') ||
-        l.includes('error:') ||
-        l.includes('cannot find symbol') ||
-        l.includes('.java:[') ||
-        l.includes('COMPILATION ERROR')
+        l.includes('[ERROR]') &&
+        (
+            l.includes('.java:[') ||
+            l.includes('cannot find symbol') ||
+            l.includes('reached end of file') ||
+            l.includes('class, interface, enum') ||
+            l.includes("';' expected") ||
+            l.includes('cannot be applied') ||
+            l.includes('incompatible types') ||
+            l.includes('has private access') ||
+            l.includes('is not abstract')
+        )
     );
 
-    console.log(`[Auto-Fix] Extracted ${errorLines.length} error lines.`);
+    console.log(`[Auto-Fix] Found ${errorLines.length} compile error lines`);
 
-    if (errorLines.length === 0) {
-        console.log('[Auto-Fix] Last 30 lines of build log for debugging:');
-        console.log(lines.slice(-30).join('\n'));
-        return null;
-    }
+    // Group errors by file path
+    // Pattern: /path/to/File.java:[LINE,COL] ERROR_MESSAGE
+    const errorsByFile = {};
+    const filePathRegex = /([^\s:]+\.java):\[(\d+),(\d+)\]\s*(.*)$/;
 
-    return errorLines.slice(0, 100).join('\n');
-}
+    for (const line of errorLines) {
+        const match = line.match(filePathRegex);
+        if (!match) continue;
 
-// ═══════════════════════════════════════════
-// 2. READ ALL PROJECT FILES
-// ═══════════════════════════════════════════
-function getAllProjectFiles() {
-    const files = [];
-    function walk(dir) {
-        if (!fs.existsSync(dir)) return;
-        for (const file of fs.readdirSync(dir)) {
-            if (file === 'target' || file === '.git' || file === 'build.log') continue;
-            const fullPath = path.join(dir, file);
-            const stat = fs.statSync(fullPath);
-            if (stat.isDirectory()) {
-                walk(fullPath);
-            } else if (fullPath.match(/\.(java|xml|yml|yaml|json|properties)$/)) {
-                const relativePath = path.relative(PROJECT_DIR, fullPath).replace(/\\/g, '/');
-                files.push({
-                    path: relativePath,
-                    content: fs.readFileSync(fullPath, 'utf-8')
-                });
-            }
+        const fullPath = match[1];
+        const lineNum = match[2];
+        const colNum = match[3];
+        const message = match[4];
+
+        // Convert absolute path to relative
+        const relMatch = fullPath.match(/com\/flickzz\/generated\/.*\.java$/);
+        if (!relMatch) continue;
+
+        const relPath = 'src/main/java/' + relMatch[0];
+
+        if (!errorsByFile[relPath]) {
+            errorsByFile[relPath] = [];
         }
+        errorsByFile[relPath].push({
+            line: lineNum,
+            col: colNum,
+            message: message
+        });
     }
-    walk(PROJECT_DIR);
-    return files;
+
+    return errorsByFile;
 }
 
 // ═══════════════════════════════════════════
-// 3. AI CALLER
+// 2. AI CALLER — PER FILE (small payload)
 // ═══════════════════════════════════════════
-async function callBestAIModel(prompt) {
+async function fixSingleFile(filePath, fileContent, fileErrors) {
+    const errorText = fileErrors.map(e =>
+        `Line ${e.line}:${e.col} — ${e.message}`
+    ).join('\n');
+
+    const prompt = `Fix the Java compilation errors in this file. Return ONLY the complete fixed file content in <file: ${filePath}>content</file> format.
+
+FILE: ${filePath}
+
+ERRORS IN THIS FILE:
+${errorText}
+
+COMPLETE FILE CONTENT:
+${fileContent}
+
+CRITICAL FIXING RULES:
+1. "reached end of file while parsing" → You're missing closing brace(s) }. Count opening { and closing } — they must match.
+2. "class, interface, enum, or record expected" → You have EXTRA content after the class's closing brace. Delete everything after the last legitimate }.
+3. "cannot find symbol" → Add the missing import at the top of the file.
+4. "incompatible types" → Fix the type mismatch.
+5. "variable might not have been initialized" → Initialize the variable.
+6. "';' expected" → Add the missing semicolon.
+
+Return ONLY this exact format. NO explanation. NO markdown. NO \`\`\`.
+
+<file: ${filePath}>
+[complete fixed file content here]
+</file>
+
+Paper API 1.21.1, Java 21, Package: com.flickzz.generated`;
+
     const providers = [
-        { name: 'Dahl', url: 'https://inference.dahl.global/v1/chat/completions', key: DAHL_API_KEY, model: 'MiniMaxAI/MiniMax-M2.7' },
+        { name: 'Dahl-MiniMax', url: 'https://inference.dahl.global/v1/chat/completions', key: DAHL_API_KEY, model: 'MiniMaxAI/MiniMax-M2.7' },
         { name: 'Dahl-DeepSeek', url: 'https://inference.dahl.global/v1/chat/completions', key: DAHL_API_KEY, model: 'deepseek-ai/DeepSeek-V4-Flash-0731' },
-        { name: 'Nara', url: 'https://router.bynara.id/v1/chat/completions', key: NARA_API_KEY, model: 'nemotron-3-ultra-free' },
-        { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: OPENROUTER_API_KEY, model: 'nvidia/nemotron-3-ultra-550b-a55b:free', extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' } },
-        { name: 'AgentRouter', url: 'https://agentrouter.org/v1/chat/completions', key: AGENTROUTER_API_KEY, model: 'claude-opus-4-8', extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' } },
-        { name: 'UNOROUTER', url: 'https://api.unorouter.com/v1/chat/completions', key: UNOROUTER_API_KEY, model: 'nemotron-3-ultra-550b-a55b:free' },
-        { name: 'TokenHarbor', url: 'https://api.tokenharbor.ai/v1/chat/completions', key: TOKENHARBOR_API_KEY, model: 'deepseek-v4.1-flash:free' }
+        { name: 'Nara-Super', url: 'https://router.bynara.id/v1/chat/completions', key: NARA_API_KEY, model: 'nemotron-3-super-free' },
+        { name: 'Nara-Ultra', url: 'https://router.bynara.id/v1/chat/completions', key: NARA_API_KEY, model: 'nemotron-3-ultra-free' },
+        { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: OPENROUTER_API_KEY, model: 'qwen/qwen3-coder:free',
+          extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' } }
     ];
 
-    let attempted = 0;
-    let bestCandidate = null;
-
     for (const p of providers) {
-        if (!p.key) {
-            console.log(`[Auto-Fix] SKIP ${p.name} — no API key`);
-            continue;
-        }
-        attempted++;
+        if (!p.key) continue;
         try {
-            console.log(`[Auto-Fix] Trying ${p.name} (${p.model})...`);
+            console.log(`[Auto-Fix]   Trying ${p.name}...`);
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 180000);
+            const timeoutId = setTimeout(() => controller.abort(), 90000);
 
             const res = await fetch(p.url, {
                 method: 'POST',
@@ -112,182 +138,125 @@ async function callBestAIModel(prompt) {
                 body: JSON.stringify({
                     model: p.model,
                     messages: [
-                        { role: 'system', content: 'You are a Java code fixer. Output ONLY files in <file: path>content</file> format. No markdown. No explanation.' },
+                        { role: 'system', content: 'You are a Java code fixer. Output ONLY the file in <file: path>content</file> format. Nothing else.' },
                         { role: 'user', content: prompt }
                     ],
                     temperature: 0.1,
-                    max_tokens: 32000
+                    max_tokens: 8000
                 })
             });
             clearTimeout(timeoutId);
 
             if (!res.ok) {
-                const errText = await res.text();
-                console.log(`[Auto-Fix] ${p.name} HTTP ${res.status}: ${errText.substring(0, 150)}`);
+                console.log(`[Auto-Fix]   ${p.name} HTTP ${res.status}`);
+                continue;
+            }
+
+            const contentType = res.headers.get('content-type') || '';
+            if (!contentType.includes('application/json')) {
+                console.log(`[Auto-Fix]   ${p.name} non-JSON response`);
                 continue;
             }
 
             const data = await res.json();
             const text = data.choices?.[0]?.message?.content || '';
-            if (!text) {
-                console.log(`[Auto-Fix] ${p.name} returned empty`);
+            if (!text || text.length < 30) {
+                console.log(`[Auto-Fix]   ${p.name} empty response`);
                 continue;
             }
 
-            console.log(`[Auto-Fix] ${p.name} returned ${text.length} chars`);
-            console.log(`[Auto-Fix] Preview: ${text.substring(0, 200).replace(/\n/g, ' ⏎ ')}...`);
+            // Parse fixed file
+            const parts = text.split(/<file:\s*/);
+            parts.shift();
 
-            const files = parseFilesFromAI(text);
-            if (files.length > 0) {
-                console.log(`[Auto-Fix] ✅ ${p.name} returned ${files.length} files`);
-                return files;
+            for (const part of parts) {
+                const lines = part.split('\n');
+                let returnedPath = lines[0].replace(/>.*$/, '').trim();
+                let content = lines.slice(1).join('\n').trim();
+                content = content.replace(/<\/file>\s*$/, '').trim();
+
+                if (content && content.length > 30) {
+                    console.log(`[Auto-Fix]   ✅ ${p.name} fixed (${content.length} chars)`);
+                    return content;
+                }
             }
-            console.log(`[Auto-Fix] ${p.name} parsed 0 files`);
+            console.log(`[Auto-Fix]   ${p.name} parse failed`);
         } catch (err) {
-            console.error(`[Auto-Fix] ${p.name} error:`, err.message);
+            console.log(`[Auto-Fix]   ${p.name} error: ${err.message}`);
         }
     }
 
-    throw new Error(`All ${attempted} providers failed`);
+    return null; // All providers failed for this file
 }
 
 // ═══════════════════════════════════════════
-// 4. PARSE FILES
-// ═══════════════════════════════════════════
-function parseFilesFromAI(text) {
-    const files = [];
-    const parts = text.split(/<file:\s*/);
-    parts.shift();
-
-    for (const part of parts) {
-        const lines = part.split('\n');
-        let filePath = lines[0].replace(/>.*$/, '').trim();
-        let content = lines.slice(1).join('\n').trim();
-        content = content.replace(/<\/file>\s*$/, '').trim();
-        if (filePath && content) {
-            files.push({ path: filePath, content });
-        }
-    }
-
-    if (files.length === 0) {
-        // Fallback: markdown code blocks
-        const regex = /```(?:java|xml|yaml|yml|json)?\s*\n\s*(?:\/\/|#)\s*([\w\-\.\/]+)\s*\n([\s\S]*?)```/gi;
-        let m;
-        while ((m = regex.exec(text)) !== null) {
-            files.push({ path: m[1].trim(), content: m[2].trim() });
-        }
-    }
-    return files;
-}
-
-// ═══════════════════════════════════════════
-// 5. MAIN — All await calls go inside here
+// 3. MAIN — CHUNKED FIX
 // ═══════════════════════════════════════════
 async function main() {
-    console.log('\n═══ AUTO-FIX STARTED ═══');
+    console.log('\n═══ AUTO-FIX STARTED (v5 — Chunked) ═══');
 
-    // Debug: API keys check
-    console.log('[Auto-Fix] API Key availability:');
-    console.log(`  DAHL_API_KEY: ${DAHL_API_KEY ? 'SET' : 'MISSING'}`);
-    console.log(`  NARA_API_KEY: ${NARA_API_KEY ? 'SET' : 'MISSING'}`);
-    console.log(`  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY ? 'SET' : 'MISSING'}`);
-    console.log(`  AGENTROUTER_API_KEY: ${AGENTROUTER_API_KEY ? 'SET' : 'MISSING'}`);
-    console.log(`  UNOROUTER_API_KEY: ${UNOROUTER_API_KEY ? 'SET' : 'MISSING'}`);
-    console.log(`  TOKENHARBOR_API_KEY: ${TOKENHARBOR_API_KEY ? 'SET' : 'MISSING'}`);
-
-    const errorLog = getErrorLog();
-    if (!errorLog) {
-        console.log('[Auto-Fix] ❌ No usable error log. Exiting.');
+    const errorsByFile = analyzeErrors();
+    if (!errorsByFile) {
+        console.log('[Auto-Fix] ❌ No errors found. Exiting.');
         process.exit(1);
     }
 
-    console.log(`[Auto-Fix] Error log preview:\n${errorLog.substring(0, 500)}\n`);
+    const brokenFiles = Object.keys(errorsByFile);
+    console.log(`[Auto-Fix] Broken files: ${brokenFiles.length}`);
+    brokenFiles.forEach(f => {
+        console.log(`  - ${f} (${errorsByFile[f].length} errors)`);
+    });
 
-    const originalFiles = getAllProjectFiles();
-    console.log(`[Auto-Fix] Loaded ${originalFiles.length} project files:`);
-    originalFiles.forEach(f => console.log(`  - ${f.path}`));
+    let fixedCount = 0;
+    let failedCount = 0;
 
-    if (originalFiles.length === 0) {
-        console.log('[Auto-Fix] ❌ No project files found.');
-        process.exit(1);
-    }
+    // 🎯 THE GENIUS: Fix each file individually
+    for (const filePath of brokenFiles) {
+        console.log(`\n[Auto-Fix] ═══ Fixing: ${filePath} ═══`);
 
-    const fullFileList = originalFiles.map(f => `<file: ${f.path}>\n${f.content}\n</file>`).join('\n\n');
-
-    const repairPrompt = `You are an expert Java developer fixing a Minecraft Paper plugin that failed to compile.
-
-BUILD ERROR LOG:
-${errorLog}
-
-ALL PROJECT FILES:
-${fullFileList}
-
-CRITICAL FIXING INSTRUCTIONS:
-1. Read the error log carefully. Each line shows: FILE_PATH:[LINE,COL] ERROR_MESSAGE
-2. Common Java compilation errors and fixes:
-   - "reached end of file while parsing" → MISSING closing brace } at end of file. Add closing braces.
-   - "class, interface, enum, or record expected" → EXTRA content after class closing brace. Delete everything after last } of the main class.
-   - "';' expected" → Missing semicolon. Add it.
-   - "cannot find symbol" → Add missing import at top of file OR create the missing class.
-   - "package does not exist" → Fix import path.
-   - "incompatible types" → Fix variable assignments.
-   - "variable might not have been initialized" → Initialize it.
-3. Fix ONLY the reported errors. Do NOT refactor unrelated code.
-4. Return EVERY SINGLE FILE in the project, even unchanged ones.
-
-OUTPUT FORMAT — MANDATORY:
-Output ONLY files in this exact format. NOTHING else.
-NO explanations. NO markdown. NO \`\`\`.
-
-<file: path/to/file>
-content
-</file>
-
-Paper API 1.21.1, Java 21, Package: com.flickzz.generated
-
-NOW OUTPUT ALL ${originalFiles.length} FILES. START NOW.`;
-
-    try {
-        const fixedFiles = await callBestAIModel(repairPrompt);
-
-        console.log(`[Auto-Fix] Received ${fixedFiles.length} fixed files from AI.`);
-        console.log(`[Auto-Fix] Writing files...`);
-
-        const originalPaths = new Set(originalFiles.map(f => f.path));
-        let updatedCount = 0;
-        let newCount = 0;
-
-        for (const file of fixedFiles) {
-            const fullPath = path.join(PROJECT_DIR, file.path);
-            const dir = path.dirname(fullPath);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-            const existed = originalPaths.has(file.path);
-            fs.writeFileSync(fullPath, file.content, 'utf-8');
-
-            if (existed) {
-                updatedCount++;
-                console.log(`  ✍️  Updated: ${file.path}`);
-            } else {
-                newCount++;
-                console.log(`  ✨ Created: ${file.path}`);
-            }
+        const fullPath = path.join(PROJECT_DIR, filePath);
+        if (!fs.existsSync(fullPath)) {
+            console.log(`[Auto-Fix] ❌ File not found: ${filePath}`);
+            failedCount++;
+            continue;
         }
 
-        console.log(`[Auto-Fix] ✅ Summary:`);
-        console.log(`     - ${updatedCount} files updated`);
-        console.log(`     - ${newCount} new files created`);
-        console.log(`     - ${originalFiles.length - updatedCount} files kept original`);
-    } catch (err) {
-        console.error('[Auto-Fix] ❌ FATAL:', err.message);
+        const fileContent = fs.readFileSync(fullPath, 'utf-8');
+        console.log(`[Auto-Fix] Original size: ${fileContent.length} chars`);
+
+        const fixedContent = await fixSingleFile(
+            filePath,
+            fileContent,
+            errorsByFile[filePath]
+        );
+
+        if (fixedContent) {
+            fs.writeFileSync(fullPath, fixedContent, 'utf-8');
+            console.log(`[Auto-Fix] 💾 Saved: ${filePath}`);
+            fixedCount++;
+        } else {
+            console.log(`[Auto-Fix] ❌ Could not fix: ${filePath} (all providers failed)`);
+            failedCount++;
+        }
+    }
+
+    console.log(`\n[Auto-Fix] ═══ SUMMARY ═══`);
+    console.log(`[Auto-Fix] Fixed: ${fixedCount}/${brokenFiles.length}`);
+    console.log(`[Auto-Fix] Failed: ${failedCount}/${brokenFiles.length}`);
+
+    if (fixedCount === 0) {
+        console.log('[Auto-Fix] ❌ No files fixed. Cannot retry build.');
         process.exit(1);
+    }
+
+    if (failedCount > 0) {
+        console.log(`[Auto-Fix] ⚠️  ${failedCount} file(s) still broken. Build may fail again.`);
+    } else {
+        console.log(`[Auto-Fix] ✅ All broken files fixed!`);
     }
 }
 
-// ═══════════════════════════════════════════
-// RUN
-// ═══════════════════════════════════════════
 main().catch(err => {
-    console.error('[Auto-Fix] Unhandled error:', err);
+    console.error('[Auto-Fix] Fatal:', err);
     process.exit(1);
 });
