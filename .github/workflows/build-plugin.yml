@@ -63,8 +63,10 @@ jobs:
           cd plugin-src
           set +e
           BUILD_SUCCESS=false
+          FINAL_ATTEMPT=0
 
           for attempt in 1 2 3; do
+            FINAL_ATTEMPT=$attempt
             echo "═══════════════════════════════════════════"
             echo "BUILD ATTEMPT $attempt"
             echo "═══════════════════════════════════════════"
@@ -79,15 +81,16 @@ jobs:
             fi
 
             echo "❌ Build failed on attempt $attempt"
+            tail -30 build.log
 
             if [ $attempt -eq 3 ]; then
               echo "❌ Max attempts reached."
               break
             fi
 
+            echo ""
             echo "🤖 Triggering Agentic AI Auto-Fix..."
             
-            # Run the new orchestrator from root, passing build.log AND project-context.json
             cd ..
             node index.js ./plugin-src ./plugin-src/build.log ./plugin-src/project-context.json
             FIX_EXIT=$?
@@ -105,6 +108,7 @@ jobs:
 
           if [ "$BUILD_SUCCESS" != "true" ]; then
             echo "❌ Build did not succeed."
+            echo "FINAL_ATTEMPT=$FINAL_ATTEMPT" >> $GITHUB_ENV
             exit 1
           fi
 
@@ -123,7 +127,7 @@ jobs:
           cd plugin-src
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
           cd ..
-          node -e "require('./scripts/verifier').verifyJar('./plugin-src/' + '$JAR_FILE'.replace('./', ''))"
+          node scripts/verify.js "./plugin-src/$JAR_FILE"
           echo "✅ Verifier Agent passed!"
 
       - name: Upload JAR to Supabase
@@ -145,7 +149,7 @@ jobs:
         run: |
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d '{"build_id":"${{ github.event.inputs.build_id }}","status":"success","artifact_key":"artifacts/${{ github.event.inputs.build_id }}.jar"}'
+            -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"success\",\"artifact_key\":\"artifacts/${{ github.event.inputs.build_id }}.jar\",\"fix_attempts\":$FINAL_ATTEMPT}"
 
       - name: Notify Backend (Failure)
         if: failure()
@@ -158,4 +162,4 @@ jobs:
           fi
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
+            -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\",\"fix_attempts\":3}"
