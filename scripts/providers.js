@@ -1,37 +1,29 @@
-// providers.js
+// providers.js (Update these parts)
 
-/**
- * Agentic AI Providers Module
- * Prioritizes robust error handling, large file previews, and exact failure logging.
- */
-
-const PROVIDERS = [
-    {
-        name: "OpenRouter-Qwen",
-        url: "https://openrouter.ai/api/v1/chat/completions",
-        model: "qwen/qwen-2.5-coder-32b-instruct", // FIXED: Updated to active Qwen model
-        apiKeyEnv: "OPENROUTER_API_KEY",
-        maxTokens: 4096,
-    },
-    {
-        name: "OpenAI-GPT4o",
-        url: "https://api.openai.com/v1/chat/completions",
-        model: "gpt-4o",
-        apiKeyEnv: "OPENAI_API_KEY",
-        maxTokens: 4096,
-    },
-    {
-        name: "Anthropic-Claude",
-        url: "https://api.anthropic.com/v1/messages",
-        model: "claude-3-5-sonnet-20240620",
-        apiKeyEnv: "ANTHROPIC_API_KEY",
-        maxTokens: 4096,
+// 1. Update buildPrompt to accept feedback
+function buildPrompt(code, fileName, isPreview, feedback = "") {
+    let prompt = `You are an expert AI coding assistant. Your task is to fix the code in the file: ${fileName}.\n`;
+    
+    if (feedback) {
+        prompt += `\n⚠️ PREVIOUS ATTEMPT FAILED! Feedback: ${feedback}\nPlease fix this specific issue in your new response.\n`;
     }
-    // REMOVED: TokenHarbor (Broken URL / Deprecated API)
-];
 
-/**
- * Helper to construct the AI prompt based on file size and context
+    if (isPreview) {
+        prompt += `NOTE: This is a PREVIEW of a large file. Analyze the provided snippet and suggest precise patches or fixes.\n`;
+    } else {
+        prompt += `Please provide the fully corrected code. Output ONLY the code without markdown formatting.\n`;
+    }
+
+    prompt += `\n--- CODE START ---\n${code}\n--- CODE END ---\n`;
+    return prompt;
+}
+
+// 2. Update fixCodeWithProviders signature
+async function fixCodeWithProviders(code, fileName, feedback = "") {
+    // ... (large file preview logic remains the same)
+    const prompt = buildPrompt(contentToSend, fileName, isPreview, feedback);
+    // ... (rest of the provider loop remains the same)
+}
  */
 function buildPrompt(code, fileName, isPreview) {
     let prompt = `You are an expert AI coding assistant. Your task is to fix the code in the file: ${fileName}.\n`;
