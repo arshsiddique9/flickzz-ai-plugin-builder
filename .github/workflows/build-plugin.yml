@@ -14,15 +14,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # 🔧 Auto-Fixer API Keys
       DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
       NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
       UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
       TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      KILO_API_KEY: ${{ secrets.KILO_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
@@ -51,30 +48,22 @@ jobs:
           fi
           unzip -q source.zip && rm source.zip
           echo "✅ Source extracted"
-          echo "Files extracted:"
           find . -type f | head -30
 
-      # 🆕 BUILD PROJECT CONTEXT (for auto-fixer to understand the project)
+      # 🆕 BUILD PROJECT CONTEXT
       - name: Build Project Context
         run: |
           cd plugin-src
           export USER_PROMPT="${{ github.event.inputs.plugin_name }}"
-          if [ -f "../scripts/build-context.js" ]; then
-            node ../scripts/build-context.js || echo "⚠️ Context generation skipped (non-fatal)"
-          else
-            echo "⚠️ build-context.js not found, skipping"
-          fi
-          if [ -f "project-context.json" ]; then
-            echo "✅ Project context generated:"
-            head -50 project-context.json
-          fi
+          node ../scripts/build-context.js
+          echo "=== Context File Preview ==="
+          head -60 project-context.json
 
       - name: Build with Maven (with Auto-Fix Loop)
         id: build_step
         run: |
           cd plugin-src
           set +e
-
           BUILD_SUCCESS=false
 
           for attempt in 1 2 3; do
@@ -92,33 +81,30 @@ jobs:
             fi
 
             echo "❌ Build failed on attempt $attempt"
-            echo "Last 30 lines of build.log:"
             tail -30 build.log
 
             if [ $attempt -eq 3 ]; then
-              echo "❌ Max attempts reached. Build failed permanently."
+              echo "❌ Max attempts reached."
               break
             fi
 
             echo ""
-            echo "🤖 Triggering AI Auto-Fix (attempt $attempt)..."
-
+            echo "🤖 Triggering AI Auto-Fix..."
             node ../scripts/auto-fix.js
             FIX_EXIT=$?
 
             if [ $FIX_EXIT -ne 0 ]; then
-              echo "❌ Auto-Fix failed to run (exit code $FIX_EXIT). Aborting."
+              echo "❌ Auto-Fix failed (exit code $FIX_EXIT). Aborting."
               break
             fi
 
             echo "✅ Auto-Fix completed. Retrying Maven build..."
-            echo ""
           done
 
           set -e
 
           if [ "$BUILD_SUCCESS" != "true" ]; then
-            echo "❌ Build did not succeed after all attempts."
+            echo "❌ Build did not succeed."
             exit 1
           fi
 
@@ -142,7 +128,7 @@ jobs:
             -H "Content-Type: application/java-archive" \
             -H "x-upsert: true" \
             --data-binary "@$JAR_FILE"
-          echo "✅ JAR uploaded to Supabase"
+          echo "✅ JAR uploaded"
 
       - name: Notify Backend (Success)
         if: success()
@@ -158,7 +144,7 @@ jobs:
           if [ -f build.log ]; then
             ERROR_MSG=$(tail -c 2000 build.log | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
           else
-            ERROR_MSG="Build failed before Maven log was created"
+            ERROR_MSG="Build failed before Maven log"
           fi
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
