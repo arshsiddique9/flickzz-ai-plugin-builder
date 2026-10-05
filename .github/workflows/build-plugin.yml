@@ -55,7 +55,6 @@ jobs:
           export USER_PROMPT="${{ github.event.inputs.plugin_name }}"
           [ -f ../scripts/build-context.js ] && node ../scripts/build-context.js || true
 
-      # 🆕 DIAGNOSTIC: Probe all providers first
       - name: Probe Free Models
         run: |
           set +e
@@ -63,7 +62,6 @@ jobs:
           node index.js --probe
           echo "--- probe complete ---"
 
-      # 🆕 AGENTIC FIX LOOP
       - name: Run Agentic Auto-Fix
         id: agent
         run: |
@@ -123,6 +121,9 @@ jobs:
             -H "x-upsert: true" \
             --data-binary "@$JAR_FILE"
 
+      # ═══════════════════════════════════════════
+      # ✅ FIXED: if: always() ensures callback ALWAYS fires
+      # ═══════════════════════════════════════════
       - name: Notify Backend (Success)
         if: env.BUILD_SUCCESS == 'true'
         run: |
@@ -131,11 +132,11 @@ jobs:
             -d '{"build_id":"${{ github.event.inputs.build_id }}","status":"success","artifact_key":"artifacts/${{ github.event.inputs.build_id }}.jar"}'
 
       - name: Notify Backend (Failure)
-        if: env.BUILD_SUCCESS != 'true'
+        if: ${{ always() && env.BUILD_SUCCESS != 'true' }}
         run: |
           cd plugin-src
           ERROR_MSG=$(tail -c 2000 build.log 2>/dev/null | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
-          [ -z "$ERROR_MSG" ] && ERROR_MSG="Build failed"
+          [ -z "$ERROR_MSG" ] && ERROR_MSG="Build failed without log"
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
