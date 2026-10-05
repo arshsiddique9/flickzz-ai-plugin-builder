@@ -63,16 +63,19 @@ jobs:
             node ../scripts/build-context.js || true
           fi
 
-      # 🆕 AGENTIC FIX LOOP
+      # 🆕 AGENTIC FIX LOOP — set +e add kiya
       - name: Run Agentic Auto-Fix
         id: agent
         run: |
+          set +e   # ← YE LINE CRITICAL HAI! Iske bina mvn fail hote hi step exit kar jata hai
+          
           cd $GITHUB_WORKSPACE
-          # First attempt: try raw build
           cd plugin-src
           mvn -B clean package -DskipTests > build.log 2>&1
           MVN_EXIT=$?
           cd ..
+          
+          echo "=== Maven exit code: $MVN_EXIT ==="
           
           if [ $MVN_EXIT -eq 0 ]; then
             echo "✅ Build succeeded without fixes!"
@@ -82,9 +85,17 @@ jobs:
           
           echo "❌ Initial build failed. Spawning agent..."
           
-          # Run agent — it will iterate up to 25 steps
+          # Diagnostic: check files exist
+          echo "=== Files in scripts/ ==="
+          ls -la scripts/ || echo "NO scripts folder!"
+          echo "=== Root index.js ==="
+          ls -la index.js || echo "NO index.js!"
+          
+          # Run agent
           node index.js ./plugin-src 25
           AGENT_EXIT=$?
+          
+          echo "=== Agent exit code: $AGENT_EXIT ==="
           
           if [ $AGENT_EXIT -ne 0 ]; then
             echo "❌ Agent failed to fix the build."
@@ -98,6 +109,8 @@ jobs:
           MVN_EXIT=$?
           cd ..
           
+          echo "=== Final Maven exit code: $MVN_EXIT ==="
+          
           if [ $MVN_EXIT -eq 0 ]; then
             echo "✅ Final build succeeded!"
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
@@ -108,7 +121,7 @@ jobs:
           fi
 
       - name: Find JAR
-        if: success()
+        if: env.BUILD_SUCCESS == 'true'
         run: |
           cd plugin-src
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
@@ -120,7 +133,7 @@ jobs:
           echo "JAR_PATH=$JAR_FILE" >> $GITHUB_ENV
 
       - name: Verify JAR (Verifier Agent)
-        if: success()
+        if: env.BUILD_SUCCESS == 'true'
         run: |
           cd plugin-src
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
@@ -130,7 +143,7 @@ jobs:
           fi
 
       - name: Upload JAR to Supabase
-        if: success()
+        if: env.BUILD_SUCCESS == 'true'
         run: |
           cd plugin-src
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
@@ -144,14 +157,14 @@ jobs:
           echo "✅ JAR uploaded"
 
       - name: Notify Backend (Success)
-        if: success()
+        if: env.BUILD_SUCCESS == 'true'
         run: |
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -d '{"build_id":"${{ github.event.inputs.build_id }}","status":"success","artifact_key":"artifacts/${{ github.event.inputs.build_id }}.jar","fix_attempts":1}'
 
       - name: Notify Backend (Failure)
-        if: failure()
+        if: env.BUILD_SUCCESS != 'true'
         run: |
           cd plugin-src
           if [ -f build.log ]; then
