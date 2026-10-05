@@ -1,36 +1,46 @@
 // index.js
+// Agentic entry point — reads workspace, spawns agent, fixes build
 
-const { processDirectory } = require('./scripts/orchestrator');
-const { researchDependencies } = require('./scripts/researcher'); // 🆕 Researcher Agent
 const fs = require('fs');
 const path = require('path');
+const { runAgent } = require('./scripts/agent-loop');
 
 const args = process.argv.slice(2);
-const dirPath = args[0] || './plugin-src';
-const logPath = args[1]; // build.log path
-const contextPath = args[2]; // project-context.json path
+const workspacePath = args[0] || './plugin-src';
+const maxSteps = parseInt(args[1]) || 25;
 
-if (!fs.existsSync(dirPath)) {
-    console.error(`❌ Directory not found: ${dirPath}`);
+if (!fs.existsSync(workspacePath)) {
+    console.error(`❌ Workspace not found: ${workspacePath}`);
     process.exit(1);
 }
 
-console.log(`[CLI] Starting Agentic Engine...`);
-console.log(`[CLI] Target Directory: ${dirPath}`);
-console.log(`[CLI] Build Log: ${logPath || 'Not provided'}`);
-console.log(`[CLI] Context File: ${contextPath || 'Not provided'}`);
+process.env.WORKSPACE_ROOT = path.resolve(workspacePath);
 
-// 1. Run Researcher Agent to find dependencies
-const detectedDeps = researchDependencies(dirPath);
-let depContext = "";
-if (detectedDeps.length > 0) {
-    depContext = `\n\n[RESEARCHER AGENT REPORT]\nDetected External Dependencies: ${detectedDeps.join(', ')}\nEnsure these are properly imported and available in pom.xml.`;
-}
+console.log(`\n🚀 FlickZZ Agentic Engine`);
+console.log(`📁 Workspace: ${path.resolve(workspacePath)}`);
+console.log(`🔄 Max Steps: ${maxSteps}\n`);
 
-// 2. Process Directory with Orchestrator
-processDirectory(dirPath, logPath, contextPath, depContext)
-    .then(() => console.log("\n✅ Agentic Fix Process Completed."))
+const initialPrompt = `You are working in the directory: ${process.env.WORKSPACE_ROOT}
+
+Your job: fix the Maven build so it compiles successfully.
+
+START NOW by running:
+  mvn -B clean package -DskipTests 2>&1 | tail -60
+
+Then read the errors, fix the code with write_file, and recompile. Repeat until success.
+When the build succeeds, call task_complete(true, "...").`;
+
+runAgent(initialPrompt, maxSteps)
+    .then(result => {
+        if (result.success) {
+            console.log(`\n✅ Agent succeeded: ${result.summary}`);
+            process.exit(0);
+        } else {
+            console.error(`\n❌ Agent failed: ${result.reason}`);
+            process.exit(1);
+        }
+    })
     .catch(err => {
-        console.error("\n❌ Unexpected Error:", err);
+        console.error(`\n❌ Agent crashed:`, err);
         process.exit(1);
     });
