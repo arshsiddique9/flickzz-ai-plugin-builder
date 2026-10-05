@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { trimAfterClass, fixBraces } = require('./auto-fix');
 const { fixCodeWithProviders } = require('./providers');
+const { parseErrorLog } = require('./parse-error'); // 🆕 Naya import
 
 function verifyCode(code) {
     let openBraces = 0, closeBraces = 0;
@@ -19,7 +20,7 @@ function verifyCode(code) {
 /**
  * Process a single file
  */
-async function processFile(filePath, targetClass = null, errorLog = "") {
+async function processFile(filePath, targetClass = null, extractedErrors = "") {
     console.log(`\n[Orchestrator] 🤖 Fixing: ${path.basename(filePath)}`);
     if (!fs.existsSync(filePath)) return;
 
@@ -37,9 +38,11 @@ async function processFile(filePath, targetClass = null, errorLog = "") {
         return;
     }
 
-    // Step 2: Agentic AI Loop with Error Log
+    // Step 2: Agentic AI Loop with Extracted Errors
     const MAX_RETRIES = 3;
-    let feedback = errorLog ? `Compiler Error Log:\n${errorLog}\n\nPlease fix the code based on these errors.` : "";
+    let feedback = extractedErrors 
+        ? `Compiler Error Log:\n${extractedErrors}\n\nPlease fix the code based on these errors.` 
+        : "";
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         console.log(`[Orchestrator] 🧠 AI Attempt ${attempt}/${MAX_RETRIES} for ${fileName}...`);
@@ -70,10 +73,18 @@ async function processFile(filePath, targetClass = null, errorLog = "") {
 /**
  * Process an entire directory (Multi-File Support)
  */
-async function processDirectory(dirPath, errorLog = "") {
+async function processDirectory(dirPath, rawLogPath = "") {
     console.log(`\n========================================`);
     console.log(`[Orchestrator] 📂 Processing Directory: ${dirPath}`);
     console.log(`========================================`);
+
+    // 🆕 Yahan hum build.log ko parse kar rahe hain
+    let extractedErrors = "";
+    if (rawLogPath) {
+        console.log(`[Orchestrator] 🧐 Extracting errors from ${rawLogPath}...`);
+        extractedErrors = parseErrorLog(rawLogPath);
+        console.log(`[Orchestrator] ✅ Errors extracted. Sending only relevant errors to AI.`);
+    }
 
     const files = fs.readdirSync(dirPath, { withFileTypes: true });
     
@@ -82,10 +93,10 @@ async function processDirectory(dirPath, errorLog = "") {
         
         if (file.isDirectory()) {
             // Recursively process subdirectories
-            await processDirectory(fullPath, errorLog);
+            await processDirectory(fullPath, rawLogPath);
         } else if (file.name.endsWith('.java') || file.name.endsWith('.xml') || file.name.endsWith('.yml')) {
             // Only process relevant source files
-            await processFile(fullPath, null, errorLog);
+            await processFile(fullPath, null, extractedErrors);
         }
     }
 }
