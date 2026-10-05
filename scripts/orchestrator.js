@@ -31,125 +31,177 @@ function fileHasError(fileName, extractedErrors) {
 }
 
 /**
- * 🆕 MISSING FILE GENERATOR
- * Error log se missing classes detect karta hai aur AI se files generate karwata hai.
+ * 🆕 MISSING FILE GENERATOR v2
+ * 1. Error log ki line numbers se missing imports detect karta hai
+ * 2. Original file padh kar exact class name nikalta hai
+ * 3. AI se missing files generate karta hai
  */
-async function generateMissingFiles(dirPath, extractedErrors, projectContext, srcRoot) {
-    if (!extractedErrors) return false;
+async function generateMissingFiles(dirPath, rawLogPath, projectContext, srcRoot) {
+    if (!rawLogPath || !fs.existsSync(rawLogPath)) return false;
 
-    // Step 1: Missing classes ("symbol: class HomeManager")
-    const missingClasses = new Set();
-    const classRegex = /symbol:\s+class\s+([A-Z]\w+)/g;
-    let match;
-    while ((match = classRegex.exec(extractedErrors)) !== null) {
-        missingClasses.add(match[1]);
+    const rawLog = fs.readFileSync(rawLogPath, 'utf8');
+    const missingImports = new Map(); // className -> package
+
+    // ═══════════════════════════════════════════
+    // METHOD 1: Line-number based detection (BEST)
+    // Format: [ERROR] /path/File.java:[4,38] package X.Y.Z does not exist
+    // ═══════════════════════════════════════════
+    const lineBasedRegex = /\[ERROR\]\s+([^\s:]+\.java):\[(\d+),\d+\]\s+package\s+([\w\.]+)\s+does not exist/g;
+    let m;
+    while ((m = lineBasedRegex.exec(rawLog)) !== null) {
+        const sourceFile = m[1];
+        const lineNum = parseInt(m[2]);
+        const pkg = m[3];
+
+        if (!fs.existsSync(sourceFile)) continue;
+
+        const lines = fs.readFileSync(sourceFile, 'utf8').split('\n');
+        const lineContent = lines[lineNum - 1] || '';
+
+        // Extract FQN from import line
+        const importMatch = lineContent.match(/^\s*import\s+([\w\.]+);/);
+        if (importMatch) {
+            const fqn = importMatch[1];
+            const className = fqn.split('.').pop();
+            if (className && /^[A-Z]/.test(className)) {
+                missingImports.set(className, pkg);
+                console.log(`[MissingFiles] 📌 Line ${lineNum}: Detected missing import ${pkg}.${className}`);
+            }
+        }
     }
 
-    // Step 2: Missing packages ("package X.Y.Z does not exist")
-    const missingPackages = new Set();
-    const pkgRegex = /package\s+([\w\.]+)\s+does not exist/g;
-    while ((match = pkgRegex.exec(extractedErrors)) !== null) {
-        missingPackages.add(match[1]);
+    // ═══════════════════════════════════════════
+    // METHOD 2: "symbol: class X" detection (backup)
+    // ═══════════════════════════════════════════
+    const symbolRegex = /symbol:\s+class\s+([A-Z]\w+)/g;
+    while ((m = symbolRegex.exec(rawLog)) !== null) {
+        const className = m[1];
+        if (!missingImports.has(className)) {
+            // Find which package it should be in by scanning existing files
+            let foundPkg = null;
+            const scanDir = (dir) => {
+                if (foundPkg || !fs.existsSync(dir)) return;
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                for (const e of entries) {
+                    const fp = path.join(dir, e.name);
+                    if (e.isDirectory()) scanDir(fp);
+                    else if (e.name.endsWith('.java')) {
+                        const content = fs.readFileSync(fp, 'utf8');
+                        const im = content.match(new RegExp(`import\\s+([\\w\\.]+)\\.${className};`));
+                        if (im) { foundPkg = im[1]; return; }
+                    }
+                }
+            };
+            scanDir(srcRoot);
+            if (foundPkg) missingImports.set(className, foundPkg);
+        }
     }
 
-    // Step 3: Existing files scan karke imports map banao
-    const importsMap = {}; // className -> full package path
-
-    function scanImports(dir) {
+    // ═══════════════════════════════════════════
+    // METHOD 3: Scan all files for imports to non-existent packages
+    // ═══════════════════════════════════════════
+    function scanAllImports(dir) {
         if (!fs.existsSync(dir)) return;
         const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const entry of entries) {
-            const fullPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-                scanImports(fullPath);
-            } else if (entry.name.endsWith('.java')) {
-                const content = fs.readFileSync(fullPath, 'utf8');
-                for (const cls of missingClasses) {
-                    const regex = new RegExp(`import\\s+([\\w\\.]+)\\.${cls};`, 'g');
-                    const m = regex.exec(content);
-                    if (m) importsMap[cls] = m[1];
+        for (const e of entries) {
+            const fp = path.join(dir, e.name);
+            if (e.isDirectory()) scanAllImports(fp);
+            else if (e.name.endsWith('.java')) {
+                const content = fs.readFileSync(fp, 'utf8');
+                const importRegex = /^\s*import\s+(com\.flickzz\.[\w\.]+);/gm;
+                let im;
+                while ((im = importRegex.exec(content)) !== null) {
+                    const fqn = im[1];
+                    const parts = fqn.split('.');
+                    const className = parts.pop();
+                    const pkg = parts.join('.');
+                    
+                    // Check karo agar class file exist karti hai
+                    const expectedPath = path.join(srcRoot, pkg.split('.').join('/'), `${className}.java`);
+                    if (!fs.existsSync(expectedPath) && !missingImports.has(className)) {
+                        missingImports.set(className, pkg);
+                        console.log(`[MissingFiles] 📌 Scan: Detected missing import ${pkg}.${className}`);
+                    }
                 }
             }
         }
     }
-    scanImports(srcRoot);
+    scanAllImports(srcRoot);
 
-    if (missingClasses.size === 0) {
-        console.log(`[MissingFiles] ℹ️ No missing classes detected in error log.`);
+    if (missingImports.size === 0) {
+        console.log(`[MissingFiles] ℹ️ No missing classes detected.`);
         return false;
     }
 
-    console.log(`[MissingFiles] 🔍 Detected ${missingClasses.size} missing classes: ${[...missingClasses].join(', ')}`);
-    console.log(`[MissingFiles] 📦 Missing packages: ${[...missingPackages].join(', ') || 'none'}`);
+    console.log(`[MissingFiles] 🔍 Total missing classes: ${missingImports.size}`);
+    for (const [cls, pkg] of missingImports.entries()) {
+        console.log(`[MissingFiles]    - ${pkg}.${cls}`);
+    }
 
-    // Step 4: Har missing class ke liye file generate karo
+    // ═══════════════════════════════════════════
+    // Generate all missing files
+    // ═══════════════════════════════════════════
     let generatedCount = 0;
 
-    for (const className of missingClasses) {
-        const pkg = importsMap[className]
-                    || [...missingPackages].find(p => p.includes('.')) // closest match
-                    || 'com.flickzz.generated.managers';
+    for (const [className, pkg] of missingImports.entries()) {
         const pkgPath = pkg.split('.').join('/');
         const filePath = path.join(srcRoot, pkgPath, `${className}.java`);
 
         if (fs.existsSync(filePath)) {
-            console.log(`[MissingFiles] ⏭️ ${className}.java already exists, skipping.`);
+            console.log(`[MissingFiles] ⏭️ ${className}.java already exists.`);
             continue;
         }
 
-        console.log(`[MissingFiles] 🤖 Generating missing file: ${pkg}.${className}...`);
+        console.log(`[MissingFiles] 🤖 Generating: ${pkg}.${className}...`);
 
         const prompt = `You are an expert Minecraft Bukkit/Paper plugin developer.
 
-Generate a complete, COMPILABLE Java class file with the following specifications:
+Generate a COMPLETE, COMPILABLE Java class file.
 
 **Class Name:** ${className}
 **Package:** ${pkg}
-**File Path:** ${pkgPath}/${className}.java
-**Target:** PaperMC 1.21.1, Java 21, Maven
+**Target:** PaperMC 1.21.1, Java 21
 
-**Purpose:** This class is referenced by other files in the project but missing. Infer its purpose from its name.
-- If it ends with "Manager" (e.g., HomeManager, MessageManager) → it's a utility/manager class with static or instance methods.
-- If it ends with "Listener" → it's a Bukkit event listener implementing org.bukkit.event.Listener.
-- If it ends with "Command" → it's a command executor implementing CommandExecutor and TabCompleter.
-- If it ends with "Config" → it's a config wrapper class.
+**Infer purpose from name:**
+- Ending in "Manager" (HomeManager, MessageManager, CooldownManager) → utility/manager class with singleton getInstance(), methods to manage data
+- Ending in "Listener" (PlayerListener) → implements org.bukkit.event.Listener with @EventHandler methods
+- Ending in "Command" (HomeCommand) → implements CommandExecutor, TabCompleter
+- Ending in "Utils"/"Handler" → utility class with static methods
+- Ending in "Config" → config wrapper class
 
-**Full Project Context (for reference only):**
-${projectContext ? projectContext.substring(0, 2500) : 'N/A'}
+**Project Context:**
+${projectContext ? projectContext.substring(0, 2000) : 'N/A'}
 
-**CRITICAL RULES:**
+**STRICT RULES:**
 1. First line MUST be: package ${pkg};
-2. Include ALL necessary imports (org.bukkit.*, java.util.*, etc.)
-3. Provide a COMPLETE implementation - no placeholders, no TODO comments
-4. If it's a Manager class, include getInstance() singleton pattern
-5. Output ONLY Java code, NO markdown fences, NO explanations
-6. Last character of output MUST be a closing brace }
+2. Include ALL necessary imports (org.bukkit.*, java.util.*)
+3. NO placeholders, NO TODO — complete implementation
+4. If Manager class: include private static instance + getInstance() + constructor
+5. Output ONLY Java code — no markdown, no explanations
+6. Last character MUST be }
 
-Now generate the complete ${className}.java file:`;
+Generate complete ${className}.java:`;
 
         try {
             const result = await generateRawCode(prompt);
             if (!result.success || !result.code) {
-                console.warn(`[MissingFiles] ⚠️ Failed to generate ${className}.java`);
+                console.warn(`[MissingFiles] ⚠️ Generation failed for ${className}`);
                 continue;
             }
 
             let generatedCode = result.code;
 
-            // Ensure package declaration exists
-            if (!generatedCode.includes('package ')) {
+            if (!generatedCode.match(/^\s*package\s+/)) {
                 generatedCode = `package ${pkg};\n\n${generatedCode}`;
             }
 
-            // Verify
-            const verify = verifyCode(generatedCode, `${className}.java`);
+            let verify = verifyCode(generatedCode, `${className}.java`);
             if (!verify.valid) {
-                console.warn(`[MissingFiles] ⚠️ Generated ${className}.java invalid: ${verify.reason}`);
-                // Try to fix by trimming extra content after class
+                console.warn(`[MissingFiles] ⚠️ Invalid: ${verify.reason} — attempting trim...`);
                 generatedCode = trimAfterClass(generatedCode, className);
-                const verify2 = verifyCode(generatedCode, `${className}.java`);
-                if (!verify2.valid) {
-                    console.warn(`[MissingFiles] ❌ Still invalid after trim. Skipping.`);
+                verify = verifyCode(generatedCode, `${className}.java`);
+                if (!verify.valid) {
+                    console.warn(`[MissingFiles] ❌ Still invalid. Skipping.`);
                     continue;
                 }
             }
@@ -157,14 +209,14 @@ Now generate the complete ${className}.java file:`;
             fs.mkdirSync(path.dirname(filePath), { recursive: true });
             fs.writeFileSync(filePath, generatedCode, 'utf8');
             generatedCount++;
-            console.log(`[MissingFiles] ✅ Created: ${filePath} (${generatedCode.length} chars)`);
+            console.log(`[MissingFiles] ✅ Created: ${pkgPath}/${className}.java (${generatedCode.length} chars)`);
 
         } catch (err) {
-            console.error(`[MissingFiles] ❌ Error generating ${className}: ${err.message}`);
+            console.error(`[MissingFiles] ❌ Error: ${err.message}`);
         }
     }
 
-    console.log(`[MissingFiles] 📊 Generated ${generatedCount}/${missingClasses.size} missing files.`);
+    console.log(`[MissingFiles] 📊 Generated ${generatedCount}/${missingImports.size} files.`);
     return generatedCount > 0;
 }
 
@@ -175,14 +227,14 @@ async function processFile(filePath, projectContext = "", extractedErrors = "", 
 
     let code = fs.readFileSync(filePath, 'utf8');
     const hasError = fileHasError(fileName, extractedErrors);
-    if (hasError) console.log(`[Orchestrator] ⚠️ This file HAS errors in build log. AI will be called.`);
+    if (hasError) console.log(`[Orchestrator] ⚠️ This file HAS errors in build log.`);
 
     if (!hasError) {
         const beforeFix = code;
         code = fixBraces(code);
         const verification = verifyCode(code, fileName);
         if (verification.valid && code === beforeFix) {
-            console.log(`[Orchestrator] ✅ No issues detected for ${fileName}.`);
+            console.log(`[Orchestrator] ✅ No issues for ${fileName}.`);
             return;
         }
     } else {
@@ -192,14 +244,14 @@ async function processFile(filePath, projectContext = "", extractedErrors = "", 
     let verification = verifyCode(code, fileName);
     if (verification.valid && !hasError) {
         fs.writeFileSync(filePath, code, 'utf8');
-        console.log(`[Orchestrator] ✅ Deterministic fix successful for ${fileName}.`);
+        console.log(`[Orchestrator] ✅ Deterministic fix: ${fileName}.`);
         return;
     }
     if (!verification.valid) console.log(`[Orchestrator] ⚠️ Verification failed: ${verification.reason}`);
 
     const MAX_RETRIES = 3;
     let feedback = extractedErrors
-        ? `Compiler Error Log:\n${extractedErrors}\n\nPlease fix the code based on these errors. IMPORTANT: Do NOT remove or modify any import statements. Keep all existing imports.`
+        ? `Compiler Error Log:\n${extractedErrors}\n\nFix the code. IMPORTANT: Do NOT remove any import statements. Keep all imports intact.`
         : "";
 
     const fullContext = projectContext + depContext;
@@ -208,28 +260,28 @@ async function processFile(filePath, projectContext = "", extractedErrors = "", 
         console.log(`[Orchestrator] 🧠 AI Attempt ${attempt}/${MAX_RETRIES} for ${fileName}...`);
         const result = await fixCodeWithProviders(code, fileName, fullContext, feedback);
         if (!result.success) {
-            feedback = "Previous provider failed to respond. Please try again.";
+            feedback = "Previous provider failed. Try again.";
             continue;
         }
 
         const aiCode = result.fixedCode;
         if (!aiCode || aiCode.trim().length < 10) {
-            feedback = "Your previous response was empty or invalid. Please provide the complete fixed code.";
+            feedback = "Response was empty. Provide complete code.";
             continue;
         }
 
         const aiVerification = verifyCode(aiCode, fileName);
         if (aiVerification.valid) {
             fs.writeFileSync(filePath, aiCode, 'utf8');
-            console.log(`[Orchestrator] 🎉 AI successfully fixed ${fileName}!`);
+            console.log(`[Orchestrator] 🎉 AI fixed ${fileName}!`);
             return;
         } else {
-            feedback = `Your previous response had this error: ${aiVerification.reason}. Please fix it.`;
+            feedback = `Previous response error: ${aiVerification.reason}. Fix it.`;
             code = aiCode;
         }
     }
 
-    console.error(`[Orchestrator] ❌ FAILURE for ${fileName} after ${MAX_RETRIES} attempts.`);
+    console.error(`[Orchestrator] ❌ FAILURE for ${fileName}.`);
     fs.writeFileSync(filePath + ".broken", code, 'utf8');
 }
 
@@ -253,13 +305,15 @@ async function processDirectory(dirPath, rawLogPath = "", contextPath = "", depC
         extractedErrors = parseErrorLog(rawLogPath);
     }
 
-    // 🆕 STEP 1: Missing files generate karo (sirf TOP level pe)
+    // STEP 1: Missing files detect + generate (TOP LEVEL ONLY)
     const srcRoot = path.join(dirPath, 'src', 'main', 'java');
-    if (fs.existsSync(srcRoot) && extractedErrors) {
-        await generateMissingFiles(dirPath, extractedErrors, projectContext, srcRoot);
+    const isTopLevel = dirPath === './plugin-src' || path.basename(dirPath) === 'plugin-src';
+    
+    if (isTopLevel && fs.existsSync(srcRoot) && rawLogPath) {
+        await generateMissingFiles(dirPath, rawLogPath, projectContext, srcRoot);
     }
 
-    // 🆕 STEP 2: Baaki files fix karo
+    // STEP 2: Process files
     const files = fs.readdirSync(dirPath, { withFileTypes: true });
     for (const file of files) {
         const fullPath = path.join(dirPath, file.name);
