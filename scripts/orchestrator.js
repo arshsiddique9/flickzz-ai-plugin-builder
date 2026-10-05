@@ -5,7 +5,6 @@ const path = require('path');
 const { trimAfterClass, fixBraces } = require('./auto-fix');
 const { fixCodeWithProviders } = require('./providers');
 const { parseErrorLog } = require('./parse-error');
-const { getPlannerPrompt } = require('./agents'); // 🆕 Planner Agent import
 
 function verifyCode(code) {
     let openBraces = 0, closeBraces = 0;
@@ -18,7 +17,7 @@ function verifyCode(code) {
     return { valid: true, reason: "Code looks structurally valid" };
 }
 
-async function processFile(filePath, projectContext = "", extractedErrors = "") {
+async function processFile(filePath, projectContext = "", extractedErrors = "", depContext = "") {
     console.log(`\n[Orchestrator] 🤖 Fixing: ${path.basename(filePath)}`);
     if (!fs.existsSync(filePath)) return;
 
@@ -40,11 +39,13 @@ async function processFile(filePath, projectContext = "", extractedErrors = "") 
         ? `Compiler Error Log:\n${extractedErrors}\n\nPlease fix the code based on these errors.` 
         : "";
 
+    // Combine context with researcher report
+    const fullContext = projectContext + depContext;
+
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         console.log(`[Orchestrator] 🧠 AI Attempt ${attempt}/${MAX_RETRIES} for ${fileName}...`);
         
-        // Pass Context and Error Log to the Coder Agent
-        const result = await fixCodeWithProviders(code, fileName, projectContext, feedback);
+        const result = await fixCodeWithProviders(code, fileName, fullContext, feedback);
 
         if (!result.success) {
             feedback = "Previous provider failed to respond. Please try again.";
@@ -68,34 +69,29 @@ async function processFile(filePath, projectContext = "", extractedErrors = "") 
     fs.writeFileSync(filePath + ".broken", code, 'utf8');
 }
 
-async function processDirectory(dirPath, rawLogPath = "", contextPath = "") {
+async function processDirectory(dirPath, rawLogPath = "", contextPath = "", depContext = "") {
     console.log(`\n========================================`);
     console.log(`[Orchestrator] 📂 Processing Directory: ${dirPath}`);
     console.log(`========================================`);
 
-    // 1. Load Project Context (Researcher Agent)
     let projectContext = "No project context available.";
     if (contextPath && fs.existsSync(contextPath)) {
         projectContext = fs.readFileSync(contextPath, 'utf8');
-        console.log(`[Orchestrator] ✅ Project context loaded from ${contextPath}`);
     }
 
-    // 2. Extract Errors (Debugger Agent)
     let extractedErrors = "";
     if (rawLogPath && fs.existsSync(rawLogPath)) {
         extractedErrors = parseErrorLog(rawLogPath);
-        console.log(`[Orchestrator] ✅ Errors extracted. Sending only relevant errors to AI.`);
     }
 
-    // 3. Loop through files (Coder Agent)
     const files = fs.readdirSync(dirPath, { withFileTypes: true });
     for (const file of files) {
         const fullPath = path.join(dirPath, file.name);
         
         if (file.isDirectory()) {
-            await processDirectory(fullPath, rawLogPath, contextPath);
+            await processDirectory(fullPath, rawLogPath, contextPath, depContext);
         } else if (file.name.endsWith('.java') || file.name.endsWith('.xml') || file.name.endsWith('.yml')) {
-            await processFile(fullPath, projectContext, extractedErrors);
+            await processFile(fullPath, projectContext, extractedErrors, depContext);
         }
     }
 }
