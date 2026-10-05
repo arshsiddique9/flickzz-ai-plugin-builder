@@ -1,6 +1,6 @@
 // ============================================
-// FlickZZ Builder — Multi-Pass Generation Engine (v5.2)
-// FIXED: Added UNOROUTER & Token Harbor providers
+// FlickZZ Builder — Multi-Pass Generation Engine (v5.3)
+// FIXED: Content cleaning (strip </file> and --- garbage)
 // ============================================
 
 const fs = require('fs');
@@ -9,8 +9,8 @@ const DAHL_API_KEY = process.env.DAHL_API_KEY;
 const NARA_API_KEY = process.env.NARA_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const AGENTROUTER_API_KEY = process.env.AGENTROUTER_API_KEY;
-const UNOROUTER_API_KEY = process.env.UNOROUTER_API_KEY; // ✅ NEW
-const TOKENHARBOR_API_KEY = process.env.TOKENHARBOR_API_KEY; // ✅ NEW
+const UNOROUTER_API_KEY = process.env.UNOROUTER_API_KEY;
+const TOKENHARBOR_API_KEY = process.env.TOKENHARBOR_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const JOB_ID = process.env.JOB_ID;
@@ -102,6 +102,69 @@ function isValidContent(content) {
 }
 
 // ═══════════════════════════════════════════
+// 🆕 CONTENT CLEANER — strips AI wrapper garbage
+// Removes: </file>, --- separators, markdown fences, thinking tags
+// ═══════════════════════════════════════════
+function cleanGeneratedContent(rawContent, isResource) {
+    if (!rawContent) return '';
+
+    let content = rawContent.trim();
+
+    // 1. Remove thinking tags
+    content = content.replace(/<think>[\s\S]*?<\/think>/gi, '');
+    content = content.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+    content = content.replace(/<\/?think>/gi, '');
+    content = content.replace(/<\/?thinking>/gi, '');
+
+    // 2. Remove markdown code fences
+    content = content.replace(/^```[\w]*\s*\n?/, '');
+    content = content.replace(/\n?```\s*$/, '');
+
+    // 3. Remove `<file: path>` opening tags (if present)
+    content = content.replace(/^<file:\s*[^>]+>\s*\n?/i, '');
+
+    // 4. Remove leading AI chatter
+    content = content.replace(/^(Here is|This is|Sure,?|Okay,?|Alright,?|Now let me|Let me write)[^\n]*\n+/i, '');
+    content = content.replace(/^\/\/\s*(File:|Path:|Here is|This is).*\n/i, '');
+
+    // 5. Trim to last closing brace for Java files
+    if (!isResource) {
+        const lastBrace = content.lastIndexOf('}');
+        if (lastBrace > 0) {
+            const afterBrace = content.substring(lastBrace + 1).trim();
+            // If there's trailing garbage (</file>, ---, or short chatter)
+            if (afterBrace.length > 0 && (
+                afterBrace.includes('</file>') ||
+                afterBrace.includes('---') ||
+                afterBrace.length < 150
+            )) {
+                content = content.substring(0, lastBrace + 1);
+            }
+        }
+    }
+
+    // 6. Remove trailing </file> tags (for both Java and resource files)
+    content = content.replace(/<\/file>\s*$/gi, '');
+    content = content.replace(/\n?<\/file>\s*/gi, '\n');
+
+    // 7. Remove trailing --- separators (any count)
+    content = content.replace(/\n\s*-{3,}\s*$/g, '');
+    content = content.replace(/\n\s*-{3,}\s*\n/g, '\n');
+
+    // 8. Remove any inline <file: ...> or </file> tags that snuck in
+    content = content.replace(/<file:[^>]*>/gi, '');
+    content = content.replace(/<\/file>/gi, '');
+
+    // 9. Clean up multiple blank lines
+    content = content.replace(/\n{3,}/g, '\n\n');
+
+    // 10. Ensure trailing newline
+    content = content.trim() + '\n';
+
+    return content;
+}
+
+// ═══════════════════════════════════════════
 // AI PROVIDER — with health-aware routing
 // ═══════════════════════════════════════════
 async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
@@ -132,14 +195,12 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 4000, retries = 2) {
             models: ['gpt-6-astra', 'claude-opus-4-8', 'deepseek-v4-flash'],
             extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ Builder' }
         },
-        // ✅ NEW: UNOROUTER Provider
         {
             name: 'UNOROUTER',
             url: 'https://api.unorouter.com/v1/chat/completions',
             key: UNOROUTER_API_KEY,
             models: ['gemini-3.5-flash-lite:free', 'nemotron-3-ultra-550b-a55b:free', 'deepseek-v4-flash:free']
         },
-        // ✅ NEW: Token Harbor Provider
         {
             name: 'TokenHarbor',
             url: 'https://api.tokenharbor.ai/v1/chat/completions',
@@ -429,15 +490,18 @@ ${filesContext}
 
 CRITICAL RULES:
 1. Output ONLY the raw file content. NO markdown, NO \`\`\`, NO explanation.
-2. Use LITERAL < and > characters (never escape)
-3. Include ALL imports at the top (Java files)
-4. Package: com.flickzz.generated
-5. Import EVERY class you reference
-6. pom.xml → Paper API 1.21.1-R0.1-SNAPSHOT, Java 21, maven-compiler-plugin 3.13.0
-7. plugin.yml → api-version: '1.21', all commands + permissions
-8. config.yml → all messages with & color codes
-9. Verify methods exist in Bukkit/Paper API
-10. Add null checks, instanceof checks, try-catch
+2. 🚨 DO NOT wrap output in <file: path> tags
+3. 🚨 DO NOT end with </file> or --- separators
+4. 🚨 Start DIRECTLY with the file content (package statement for Java, or first line of resource)
+5. Use LITERAL < and > characters (never escape)
+6. Include ALL imports at the top (Java files)
+7. Package: com.flickzz.generated
+8. Import EVERY class you reference
+9. pom.xml → Paper API 1.21.1-R0.1-SNAPSHOT, Java 21, maven-compiler-plugin 3.13.0
+10. plugin.yml → api-version: '1.21', all commands + permissions
+11. config.yml → all messages with & color codes
+12. Verify methods exist in Bukkit/Paper API
+13. Add null checks, instanceof checks, try-catch
 
 COMMON MISTAKES (AVOID):
 - Missing imports
@@ -449,28 +513,19 @@ COMMON MISTAKES (AVOID):
 - Bukkit.getWorld() without null check
 - getCommand("x") without null check
 
-Output ONLY the file content. Start immediately.`;
+Output ONLY the file content. Start immediately, end at the last closing brace (Java) or last property (YAML).`;
 
     const result = await callAI(systemPrompt, `Generate the complete file: ${file.path}`, 6000);
     if (!result.ok) throw new Error(`Failed to generate ${file.path}`);
 
-    let content = result.content.trim();
-    content = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
-    content = content.replace(/^\/\/\s*(File:|Path:|Here is|This is).*\n/i, '');
-    content = content.replace(/^(Here is|This is|Sure|Okay|Alright)[^\n]*\n+/i, '');
-
-    if (!isResource) {
-        const lastBrace = content.lastIndexOf('}');
-        if (lastBrace > 0 && lastBrace < content.length - 50) {
-            content = content.substring(0, lastBrace + 1);
-        }
-    }
+    // 🆕 Use the robust cleaner
+    const content = cleanGeneratedContent(result.content, isResource);
 
     if (content.length < 30) {
         throw new Error(`Generated content too short: ${content.length} chars`);
     }
 
-    console.log(`  Generated ${content.length} chars`);
+    console.log(`  Generated ${content.length} chars (cleaned)`);
     return content;
 }
 
