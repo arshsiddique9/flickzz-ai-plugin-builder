@@ -20,21 +20,19 @@ jobs:
       AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
       UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
       TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
@@ -47,75 +45,60 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             "$DOWNLOAD_URL")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Source download failed (HTTP $HTTP_CODE)"
-            exit 1
-          fi
+          [ "$HTTP_CODE" != "200" ] && { echo "❌ Download failed: $HTTP_CODE"; exit 1; }
           unzip -q source.zip && rm source.zip
           echo "✅ Source extracted"
-          find . -type f | head -30
 
-      - name: Build Project Context
+      - name: Build Context
         run: |
           cd plugin-src
           export USER_PROMPT="${{ github.event.inputs.plugin_name }}"
-          if [ -f ../scripts/build-context.js ]; then
-            node ../scripts/build-context.js || true
-          fi
+          [ -f ../scripts/build-context.js ] && node ../scripts/build-context.js || true
 
-      # 🆕 AGENTIC FIX LOOP — set +e add kiya
+      # 🆕 DIAGNOSTIC: Probe all providers first
+      - name: Probe Free Models
+        run: |
+          set +e
+          cd $GITHUB_WORKSPACE
+          node index.js --probe
+          echo "--- probe complete ---"
+
+      # 🆕 AGENTIC FIX LOOP
       - name: Run Agentic Auto-Fix
         id: agent
         run: |
-          set +e   # ← YE LINE CRITICAL HAI! Iske bina mvn fail hote hi step exit kar jata hai
-          
+          set +e
           cd $GITHUB_WORKSPACE
           cd plugin-src
           mvn -B clean package -DskipTests > build.log 2>&1
           MVN_EXIT=$?
           cd ..
-          
           echo "=== Maven exit code: $MVN_EXIT ==="
-          
+
           if [ $MVN_EXIT -eq 0 ]; then
-            echo "✅ Build succeeded without fixes!"
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
             exit 0
           fi
-          
+
           echo "❌ Initial build failed. Spawning agent..."
-          
-          # Diagnostic: check files exist
-          echo "=== Files in scripts/ ==="
-          ls -la scripts/ || echo "NO scripts folder!"
-          echo "=== Root index.js ==="
-          ls -la index.js || echo "NO index.js!"
-          
-          # Run agent
           node index.js ./plugin-src 25
           AGENT_EXIT=$?
-          
           echo "=== Agent exit code: $AGENT_EXIT ==="
-          
+
           if [ $AGENT_EXIT -ne 0 ]; then
-            echo "❌ Agent failed to fix the build."
             echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
             exit 1
           fi
-          
-          echo "✅ Agent completed. Verifying final build..."
+
           cd plugin-src
           mvn -B clean package -DskipTests > build.log 2>&1
           MVN_EXIT=$?
           cd ..
-          
           echo "=== Final Maven exit code: $MVN_EXIT ==="
-          
+
           if [ $MVN_EXIT -eq 0 ]; then
-            echo "✅ Final build succeeded!"
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
           else
-            echo "❌ Build still failing after agent."
             echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
             exit 1
           fi
@@ -125,53 +108,34 @@ jobs:
         run: |
           cd plugin-src
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
-          if [ -z "$JAR_FILE" ]; then
-            echo "❌ No JAR found!"
-            exit 1
-          fi
-          echo "✅ Found JAR: $JAR_FILE"
+          [ -z "$JAR_FILE" ] && { echo "❌ No JAR"; exit 1; }
           echo "JAR_PATH=$JAR_FILE" >> $GITHUB_ENV
-
-      - name: Verify JAR (Verifier Agent)
-        if: env.BUILD_SUCCESS == 'true'
-        run: |
-          cd plugin-src
-          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
-          cd ..
-          if [ -f scripts/verify.js ]; then
-            node scripts/verify.js "./plugin-src/$JAR_FILE" || echo "⚠️ Verifier warning"
-          fi
 
       - name: Upload JAR to Supabase
         if: env.BUILD_SUCCESS == 'true'
         run: |
           cd plugin-src
           JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
-          ARTIFACT_KEY="artifacts/${{ github.event.inputs.build_id }}.jar"
-          curl -X POST "${{ secrets.SUPABASE_URL }}/storage/v1/object/flickzz-builder-artifacts/$ARTIFACT_KEY" \
+          curl -X POST "${{ secrets.SUPABASE_URL }}/storage/v1/object/flickzz-builder-artifacts/artifacts/${{ github.event.inputs.build_id }}.jar" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
             -H "Content-Type: application/java-archive" \
             -H "x-upsert: true" \
             --data-binary "@$JAR_FILE"
-          echo "✅ JAR uploaded"
 
       - name: Notify Backend (Success)
         if: env.BUILD_SUCCESS == 'true'
         run: |
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d '{"build_id":"${{ github.event.inputs.build_id }}","status":"success","artifact_key":"artifacts/${{ github.event.inputs.build_id }}.jar","fix_attempts":1}'
+            -d '{"build_id":"${{ github.event.inputs.build_id }}","status":"success","artifact_key":"artifacts/${{ github.event.inputs.build_id }}.jar"}'
 
       - name: Notify Backend (Failure)
         if: env.BUILD_SUCCESS != 'true'
         run: |
           cd plugin-src
-          if [ -f build.log ]; then
-            ERROR_MSG=$(tail -c 2000 build.log | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
-          else
-            ERROR_MSG="Build failed before Maven log"
-          fi
+          ERROR_MSG=$(tail -c 2000 build.log 2>/dev/null | tr '\n' '|' | sed 's/"/\\"/g' | head -c 2000)
+          [ -z "$ERROR_MSG" ] && ERROR_MSG="Build failed"
           curl -X POST "${{ github.event.inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\",\"fix_attempts\":3}"
+            -d "{\"build_id\":\"${{ github.event.inputs.build_id }}\",\"status\":\"failed\",\"error\":\"$ERROR_MSG\"}"
