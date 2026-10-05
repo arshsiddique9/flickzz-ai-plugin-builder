@@ -1,45 +1,44 @@
 // scripts/agent-loop.js
-// Real agentic loop with auto model selection across free providers
+// Real agentic loop — tries ALL working providers before giving up
 
 const { TOOL_SCHEMAS, executeTool } = require('./agent-tools');
-const { selectWorkingProvider, invalidateProvider } = require('./free-models');
+const { selectWorkingProvider, invalidateProvider, PROVIDERS } = require('./free-models');
 
 const SYSTEM_PROMPT = `You are an autonomous coding agent fixing a Minecraft Bukkit/Paper plugin (PaperMC 1.21.1, Java 21).
 
-You have these tools:
-- read_file(path): Read any file in the workspace
-- write_file(path, content): Write/overwrite a file
-- list_files(path): List all files
-- run_command(cmd): Run shell commands like 'mvn -B clean package -DskipTests'
-- task_complete(success, summary): Call when done
+Tools:
+- read_file(path) · write_file(path, content) · list_files(path) · run_command(cmd) · task_complete(success, summary)
 
-YOUR MISSION: Get the Maven build to pass by finding and fixing compile errors.
+MISSION: Get the Maven build to pass.
 
-━━━ WORKFLOW ━━━
+WORKFLOW:
 1. Run: mvn -B clean package -DskipTests 2>&1 | tail -60
-2. Read the error output. Note file paths and line numbers.
-3. Use read_file to see the problematic code.
-4. Fix with write_file. Make sure the fix is CORRECT Java syntax.
-5. Run mvn again. Repeat until build passes.
-6. Call task_complete(true, "summary").
+2. Read errors. Note file + line.
+3. read_file → see problematic code.
+4. write_file → fix. Correct Java syntax.
+5. Recompile. Repeat.
+6. task_complete(true, "summary") when build succeeds.
 
-━━━ JAVA SYNTAX RULES ━━━
-- Every { needs matching }
+JAVA RULES:
+- Every { matches }
 - Method signatures: public ReturnType name(params) { ... }
-- Every statement ends with ;
-- Package declaration is FIRST line
-- Never write code AFTER the final class closing brace
-- Imports at top: import org.bukkit.X;
+- Statements end with ;
+- Package FIRST line, imports after
+- No code AFTER final class brace
 
-━━━ EFFICIENCY ━━━
-- Fix ONE error at a time
-- Trust the compiler's line numbers
-- Don't read files you don't need
-
-START by running the build command.`;
+Start by running the build command.`;
 
 // ═══════════════════════════════════════════
-// Call provider with tools (OpenAI format)
+// Detect HTML response (means endpoint redirected/broke)
+// ═══════════════════════════════════════════
+function looksLikeHtml(text) {
+    if (!text) return false;
+    const t = text.trim().slice(0, 100).toLowerCase();
+    return t.startsWith('<!doctype') || t.startsWith('<html') || t.startsWith('<?xml');
+}
+
+// ═══════════════════════════════════════════
+// Call provider (with HTML & rate-limit detection)
 // ═══════════════════════════════════════════
 async function callProvider(provider, model, messages, tools) {
     const apiKey = process.env[provider.keyEnv];
@@ -65,72 +64,137 @@ async function callProvider(provider, model, messages, tools) {
 
     if (!res.ok) {
         const errText = (await res.text()).slice(0, 400);
-        throw new Error(`HTTP ${res.status}: ${errText}`);
+        const err = new Error(`HTTP ${res.status}: ${errText}`);
+        err.status = res.status;
+        err.isRateLimit = res.status === 429;
+        throw err;
     }
 
-    const data = await res.json();
+    const rawText = await res.text();
+
+    // Detect HTML response (endpoint broken)
+    if (looksLikeHtml(rawText)) {
+        const err = new Error(`Provider returned HTML instead of JSON (endpoint broken)`);
+        err.isHtml = true;
+        throw err;
+    }
+
+    let data;
+    try {
+        data = JSON.parse(rawText);
+    } catch (e) {
+        throw new Error(`Invalid JSON: ${rawText.slice(0, 200)}`);
+    }
+
+    if (!data.choices || !data.choices[0]) {
+        throw new Error(`No choices in response: ${rawText.slice(0, 200)}`);
+    }
+
     return data.choices[0].message;
 }
 
 // ═══════════════════════════════════════════
-// Main Agent Loop
+// Build a shuffled queue of all working providers
+// ═══════════════════════════════════════════
+async function buildProviderQueue() {
+    const queue = [];
+    const cache = require('fs').existsSync(process.env.WORKSPACE_ROOT + '/.free-model-cache.json')
+        ? JSON.parse(require('fs').readFileSync(process.env.WORKSPACE_ROOT + '/.free-model-cache.json', 'utf8'))
+        : {};
+
+    // First: all cached providers
+    for (const provider of PROVIDERS) {
+        if (cache[provider.id]?.model && process.env[provider.keyEnv]) {
+            queue.push({ provider, model: cache[provider.id].model });
+        }
+    }
+
+    // If queue is empty, do a full probe
+    if (queue.length === 0) {
+        console.log(`[Agent] No cached providers, probing...`);
+        const { probeAll } = require('./free-models');
+        const results = await probeAll();
+        for (const r of results) {
+            if (r.status === 'WORKING') {
+                const provider = PROVIDERS.find(p => p.name === r.provider);
+                if (provider) queue.push({ provider, model: r.model });
+            }
+        }
+    }
+
+    return queue;
+}
+
+// ═══════════════════════════════════════════
+// Agent main loop
 // ═══════════════════════════════════════════
 async function runAgent(initialPrompt, maxSteps = 25) {
     console.log(`\n${'═'.repeat(60)}`);
     console.log(`🤖 AGENT STARTED — max ${maxSteps} steps`);
     console.log(`${'═'.repeat(60)}\n`);
 
-    // ── Step 1: Select working provider ──
-    console.log(`[Agent] 🔎 Auto-detecting working provider...`);
-    let selection = await selectWorkingProvider();
-    if (!selection) {
-        console.log(`[Agent] ❌ No working provider found. Check API keys.`);
+    // Build a queue of ALL working providers
+    const providerQueue = await buildProviderQueue();
+
+    if (providerQueue.length === 0) {
+        console.log(`[Agent] ❌ No working providers found.`);
         return { success: false, reason: 'No provider' };
     }
-    console.log(`[Agent] ✅ Using ${selection.provider.name} / ${selection.model}\n`);
+
+    console.log(`[Agent] ✅ Queue: ${providerQueue.map(p => p.provider.name).join(' → ')}\n`);
 
     const messages = [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: initialPrompt || 'Fix the build.' }
     ];
 
-    let currentProvider = selection.provider;
-    let currentModel = selection.model;
+    let currentIdx = 0;
+    let failureCount = {}; // provider.id → count of consecutive failures
 
     for (let step = 1; step <= maxSteps; step++) {
         console.log(`\n━━━ STEP ${step}/${maxSteps} ━━━`);
-        console.log(`[Agent] 🧠 ${currentProvider.name} / ${currentModel}`);
 
         let assistantMsg = null;
-        let attempts = 0;
+        let triedCount = 0;
+        const maxTriesPerStep = providerQueue.length; // try ALL
 
-        // Try current provider, then auto-switch on failure
-        while (attempts < 2 && !assistantMsg) {
+        // Try providers in rotation until one works
+        while (triedCount < maxTriesPerStep && !assistantMsg) {
+            const { provider, model } = providerQueue[currentIdx % providerQueue.length];
+            console.log(`[Agent] 🧠 ${provider.name} / ${model}`);
+
             try {
-                assistantMsg = await callProvider(currentProvider, currentModel, messages, TOOL_SCHEMAS);
+                assistantMsg = await callProvider(provider, model, messages, TOOL_SCHEMAS);
+                failureCount[provider.id] = 0;
             } catch (err) {
-                console.log(`[Agent] ⚠️ ${currentProvider.name} failed: ${err.message.slice(0, 200)}`);
-                invalidateProvider(currentProvider.id);
-                attempts++;
+                console.log(`[Agent] ⚠️ ${provider.name} failed: ${err.message.slice(0, 180)}`);
+                failureCount[provider.id] = (failureCount[provider.id] || 0) + 1;
 
-                if (attempts < 2) {
-                    console.log(`[Agent] 🔄 Switching provider...`);
-                    const next = await selectWorkingProvider();
-                    if (!next) {
-                        console.log(`[Agent] ❌ No alternate provider. Stopping.`);
-                        return { success: false, reason: 'All providers failed' };
-                    }
-                    currentProvider = next.provider;
-                    currentModel = next.model;
-                    console.log(`[Agent] ✅ Now using ${currentProvider.name} / ${currentModel}`);
+                // HTML or 404 → invalidate cache so we don't retry
+                if (err.isHtml || (err.message && err.message.includes('404'))) {
+                    invalidateProvider(provider.id);
                 }
+
+                // Rate limit → wait briefly (only on last provider)
+                if (err.isRateLimit && triedCount === maxTriesPerStep - 1) {
+                    console.log(`[Agent] ⏱️ Rate limit — waiting 30s before retry...`);
+                    await new Promise(r => setTimeout(r, 30000));
+                }
+
+                triedCount++;
+                currentIdx++;
+
+                // Move to next provider
+                continue;
             }
         }
 
         if (!assistantMsg) {
+            console.log(`[Agent] ❌ All ${providerQueue.length} providers failed this step.`);
             return { success: false, reason: 'All providers failed' };
         }
 
+        // Push assistant message
         messages.push({
             role: 'assistant',
             content: assistantMsg.content || '',
@@ -146,17 +210,16 @@ async function runAgent(initialPrompt, maxSteps = 25) {
             return { success: false, reason: 'Agent stopped' };
         }
 
+        // Execute tool calls
         for (const tc of assistantMsg.tool_calls) {
             const toolName = tc.function.name;
             let toolArgs = {};
-            try {
-                toolArgs = JSON.parse(tc.function.arguments || '{}');
-            } catch {}
+            try { toolArgs = JSON.parse(tc.function.arguments || '{}'); } catch {}
 
-            console.log(`[Agent] 🔧 ${toolName}(${JSON.stringify(toolArgs).slice(0, 150)})`);
+            console.log(`[Agent] 🔧 ${toolName}(${JSON.stringify(toolArgs).slice(0, 120)})`);
 
             const result = executeTool(toolName, toolArgs);
-            console.log(`[Agent] 📤 ${JSON.stringify(result).slice(0, 250)}`);
+            console.log(`[Agent] 📤 ${JSON.stringify(result).slice(0, 200)}`);
 
             if (toolName === 'task_complete') {
                 console.log(`\n${'═'.repeat(60)}`);
@@ -172,7 +235,7 @@ async function runAgent(initialPrompt, maxSteps = 25) {
             });
         }
 
-        // Context window management
+        // Context management
         if (messages.length > 32) {
             const sys = messages[0];
             const recent = messages.slice(-30);
