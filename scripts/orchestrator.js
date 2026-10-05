@@ -1,4 +1,4 @@
-// orchestrator.js
+// scripts/orchestrator.js
 
 const fs = require('fs');
 const path = require('path');
@@ -7,14 +7,11 @@ const { fixCodeWithProviders } = require('./providers');
 
 /**
  * Verification Function: Checks if the code is structurally valid.
- * For now, it checks if braces are balanced. 
- * (You can add AST parsing here later for advanced verification).
  */
 function verifyCode(code) {
     let openBraces = 0;
     let closeBraces = 0;
     
-    // Basic brace balance check
     for (let char of code) {
         if (char === '{') openBraces++;
         if (char === '}') closeBraces++;
@@ -24,7 +21,6 @@ function verifyCode(code) {
         return { valid: false, reason: `Unbalanced braces. Open: ${openBraces}, Close: ${closeBraces}` };
     }
     
-    // Check if code is not empty
     if (code.trim().length === 0) {
         return { valid: false, reason: "Code is empty" };
     }
@@ -73,16 +69,14 @@ async function processFile(filePath, targetClass = null) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         console.log(`\n[Orchestrator] 🧠 AI Attempt ${attempt}/${MAX_RETRIES}...`);
         
-        // Pass the feedback from previous failed attempt to the AI
         const result = await fixCodeWithProviders(code, fileName, feedback);
         
         if (!result.success) {
             console.error(`[Orchestrator] ❌ AI Provider failed to respond. Retrying...`);
             feedback = "Previous provider failed to respond or threw an API error. Please try again.";
-            continue; // Move to next attempt
+            continue; 
         }
 
-        // AI ne code diya, ab verify karo
         const aiCode = result.fixedCode;
         const aiVerification = verifyCode(aiCode);
 
@@ -91,17 +85,13 @@ async function processFile(filePath, targetClass = null) {
             fs.writeFileSync(filePath, aiCode, 'utf8');
             return;
         } else {
-            // AI ne galti ki, toh feedback set karo aur next attempt mein bhejo
             console.warn(`[Orchestrator] ⚠️ AI produced invalid code. Reason: ${aiVerification.reason}`);
             console.log(`[Orchestrator] 🔄 Preparing feedback for next attempt...`);
             feedback = `Your previous response had the following structural error: ${aiVerification.reason}. Please fix this exact issue.`;
-            
-            // Update code to the AI's broken attempt so it can learn from its mistake
             code = aiCode; 
         }
     }
 
-    // Agar 3 attempts ke baad bhi fail hota hai
     console.error(`\n[Orchestrator] ❌ CRITICAL FAILURE: Could not fix ${fileName} after ${MAX_RETRIES} AI attempts.`);
     console.log(`[Orchestrator] Saving the best attempt (or original code) for manual review...`);
     fs.writeFileSync(filePath + ".broken", code, 'utf8');
