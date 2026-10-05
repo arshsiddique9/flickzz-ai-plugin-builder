@@ -1,5 +1,6 @@
 // ============================================
-// FlickZZ Auto-Fixer v8 — Smart Brace Fix + Context
+// FlickZZ Auto-Fixer v8 — Deterministic + Context-Aware
+// Uses your existing providers (Dahl, Nara, etc.)
 // ============================================
 
 const fs = require('fs');
@@ -10,33 +11,29 @@ const NARA_API_KEY = process.env.NARA_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const AGENTROUTER_API_KEY = process.env.AGENTROUTER_API_KEY;
 const UNOROUTER_API_KEY = process.env.UNOROUTER_API_KEY;
+const TOKENHARBOR_API_KEY = process.env.TOKENHARBOR_API_KEY;
 
 const PROJECT_DIR = process.cwd();
 const ERROR_LOG_FILE = path.join(PROJECT_DIR, 'build.log');
 const CONTEXT_FILE = path.join(PROJECT_DIR, 'project-context.json');
 
 // ═══════════════════════════════════════════
-// 🆕 DETERMINISTIC BRACE FIX (No AI needed!)
-// Fixes "reached end of file while parsing" 100%
+// 🆕 DETERMINISTIC BRACE FIX (Zero AI needed)
 // ═══════════════════════════════════════════
 function fixBraces(content) {
-    // Remove strings and comments to count braces accurately
     let clean = content
-        .replace(/\/\/[^\n]*/g, '')           // remove // comments
-        .replace(/\/\*[\s\S]*?\*\//g, '')     // remove /* */ comments
-        .replace(/"(?:\\.|[^"\\])*"/g, '""')  // remove string literals
-        .replace(/'(?:\\.|[^'\\])*'/g, "''"); // remove char literals
+        .replace(/\/\/[^\n]*/g, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/"(?:\\.|[^"\\])*"/g, '""')
+        .replace(/'(?:\\.|[^'\\])*'/g, "''");
 
     const openBraces = (clean.match(/\{/g) || []).length;
     const closeBraces = (clean.match(/\}/g) || []).length;
     const diff = openBraces - closeBraces;
 
-    if (diff === 0) {
-        return { content, fixed: false, info: 'Braces balanced' };
-    }
+    if (diff === 0) return { content, fixed: false, info: 'Braces balanced' };
 
     if (diff > 0) {
-        // Need to add closing braces
         const extra = '\n' + '}'.repeat(diff);
         return {
             content: content.trimEnd() + extra + '\n',
@@ -45,21 +42,50 @@ function fixBraces(content) {
         };
     }
 
-    // diff < 0: too many closing braces — remove extras from end
-    // Find position of the last legitimate closing brace
+    // Too many closing braces — remove extras from end
     let newContent = content;
-    let removed = 0;
     for (let i = 0; i < -diff; i++) {
         const lastBrace = newContent.lastIndexOf('}');
         if (lastBrace === -1) break;
         newContent = newContent.substring(0, lastBrace) + newContent.substring(lastBrace + 1);
-        removed++;
     }
-    return {
-        content: newContent,
-        fixed: true,
-        info: `Removed ${removed} extra closing brace(s)`
-    };
+    return { content: newContent, fixed: true, info: `Removed ${-diff} extra brace(s)` };
+}
+
+// ═══════════════════════════════════════════
+// DETERMINISTIC PACKAGE FIX (managers → manager)
+// ═══════════════════════════════════════════
+function fixPackagePaths(content, projectStructure) {
+    let fixed = content;
+    const fixes = [];
+
+    // Find all "package X.Y does not exist" patterns from existing files
+    const existingPackages = new Set();
+    for (const filePath of projectStructure) {
+        if (!filePath.endsWith('.java')) continue;
+        const fullPath = path.join(PROJECT_DIR, filePath);
+        if (!fs.existsSync(fullPath)) continue;
+        const fileContent = fs.readFileSync(fullPath, 'utf-8');
+        const pkgMatch = fileContent.match(/^package\s+([\w\.]+);/m);
+        if (pkgMatch) existingPackages.add(pkgMatch[1]);
+    }
+
+    // Find broken imports and fix them
+    for (const pkg of existingPackages) {
+        // Extract last segment
+        const lastSegment = pkg.split('.').pop();
+        // Check for common mistakes: "managers" vs "manager"
+        if (lastSegment.endsWith('s')) {
+            const singular = lastSegment.slice(0, -1);
+            const wrongPkg = pkg.replace(new RegExp(lastSegment + '$'), lastSegment + 's');
+            if (wrongPkg !== pkg && fixed.includes(wrongPkg)) {
+                fixed = fixed.split(wrongPkg).join(pkg);
+                fixes.push(`${wrongPkg} → ${pkg}`);
+            }
+        }
+    }
+
+    return { content: fixed, fixed: fixes.length > 0, info: fixes.join(', ') };
 }
 
 // ═══════════════════════════════════════════
@@ -68,7 +94,7 @@ function fixBraces(content) {
 function loadProjectContext() {
     if (!fs.existsSync(CONTEXT_FILE)) return { userPrompt: 'Unknown', files: [], packageStructure: {} };
     try { return JSON.parse(fs.readFileSync(CONTEXT_FILE, 'utf-8')); }
-    catch (e) { return { userPrompt: 'Unknown', files: [], packageStructure: {} }; }
+    catch { return { userPrompt: 'Unknown', files: [], packageStructure: {} }; }
 }
 
 function buildAIContext(projectContext) {
@@ -126,7 +152,7 @@ async function callAI(filePath, fileContent, fileErrors, aiContext) {
 
     const prompt = `Fix Java compilation errors in ONE file. Preserve ALL original code.
 
-CONTEXT:
+PROJECT CONTEXT:
 ${aiContext}
 
 FILE: ${filePath}
@@ -144,7 +170,7 @@ RULES:
 3. "cannot find symbol" → Add missing import based on CONTEXT above.
 4. "package X does not exist" → Fix import path based on CONTEXT.
 5. DO NOT change package names or class names.
-6. Return ONLY the complete file (all original code + fixes).
+6. Return COMPLETE file (all original code + fixes).
 
 Return ONLY:
 <file: ${filePath}>
@@ -160,6 +186,8 @@ Return ONLY:
           extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ' }, timeout: 90000 },
         { name: 'AgentRouter', url: 'https://agentrouter.org/v1/chat/completions', key: AGENTROUTER_API_KEY, model: 'claude-opus-4-8',
           extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ' }, timeout: 90000 },
+        { name: 'UNOROUTER', url: 'https://api.unorouter.com/v1/chat/completions', key: UNOROUTER_API_KEY, model: 'nemotron-3-ultra-550b-a55b:free', timeout: 90000 },
+        { name: 'TokenHarbor', url: 'https://api.tokenharbor.ai/v1/chat/completions', key: TOKENHARBOR_API_KEY, model: 'deepseek-v4.1-flash:free', timeout: 90000 },
     ];
 
     for (const p of providers) {
@@ -201,9 +229,8 @@ Return ONLY:
                 content = content.replace(/<\/file>\s*$/, '').trim();
                 if (content.length < 30) continue;
 
-                // Reject if response lost too much
                 if (content.length < fileContent.length * 0.5 && fileContent.length > 1000) {
-                    console.log(`[Auto-Fix]   ${p.name} response too small (${content.length} vs ${fileContent.length})`);
+                    console.log(`[Auto-Fix]   ${p.name} response too small — rejected`);
                     continue;
                 }
 
@@ -233,6 +260,7 @@ async function main() {
     const brokenFiles = Object.keys(errorsByFile);
     console.log(`[Auto-Fix] Broken files: ${brokenFiles.length}`);
 
+    const projectStructure = projectContext.files.map(f => f.path);
     let fixed = 0, failed = 0;
 
     for (const filePath of brokenFiles) {
@@ -241,35 +269,42 @@ async function main() {
         if (!fs.existsSync(fullPath)) { failed++; continue; }
 
         let content = fs.readFileSync(fullPath, 'utf-8');
-        const originalLen = content.length;
-        console.log(`[Auto-Fix] Original: ${originalLen} chars`);
+        console.log(`[Auto-Fix] Original: ${content.length} chars`);
 
-        // 🆕 STEP 1: Try deterministic brace fix first
+        // STEP 1: Deterministic brace fix
         const braceResult = fixBraces(content);
         if (braceResult.fixed) {
             console.log(`[Auto-Fix] 🔧 Brace fix: ${braceResult.info}`);
             content = braceResult.content;
         }
 
-        // Check if errors are now resolved by brace fix
-        const braceOnlyErrors = errorsByFile[filePath].every(e =>
+        // STEP 2: Deterministic package fix
+        const pkgResult = fixPackagePaths(content, projectStructure);
+        if (pkgResult.fixed) {
+            console.log(`[Auto-Fix] 🔧 Package fix: ${pkgResult.info}`);
+            content = pkgResult.content;
+        }
+
+        // Check if errors are all deterministic-resolvable
+        const allDeterministic = errorsByFile[filePath].every(e =>
             e.message.includes('reached end of file') ||
-            e.message.includes('class, interface')
+            e.message.includes('class, interface') ||
+            e.message.includes('does not exist')
         );
 
-        if (braceOnlyErrors && braceResult.fixed) {
+        if (allDeterministic && (braceResult.fixed || pkgResult.fixed)) {
             fs.writeFileSync(fullPath, content, 'utf-8');
-            console.log(`[Auto-Fix] ✅ Fixed by brace-balance (no AI needed) → ${content.length} chars`);
+            console.log(`[Auto-Fix] ✅ Fixed deterministically (no AI needed) → ${content.length} chars`);
             fixed++;
             continue;
         }
 
-        // 🆕 STEP 2: If brace fix insufficient, use AI
+        // STEP 3: AI fix
         console.log(`[Auto-Fix] Sending to AI...`);
         const fixedContent = await callAI(filePath, content, errorsByFile[filePath], aiContext);
 
         if (fixedContent) {
-            // 🆕 STEP 3: Re-check braces after AI
+            // Post-AI brace check
             const recheck = fixBraces(fixedContent);
             const finalContent = recheck.fixed ? recheck.content : fixedContent;
             if (recheck.fixed) console.log(`[Auto-Fix]   🔧 Post-AI brace fix: ${recheck.info}`);
