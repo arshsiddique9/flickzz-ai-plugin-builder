@@ -64,6 +64,9 @@ jobs:
 
       - name: Run Agentic Auto-Fix
         id: agent
+        env:
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          BUILD_ID: ${{ github.event.inputs.build_id }}
         run: |
           set +e
           cd $GITHUB_WORKSPACE
@@ -121,9 +124,6 @@ jobs:
             -H "x-upsert: true" \
             --data-binary "@$JAR_FILE"
 
-      # ═══════════════════════════════════════════
-      # ✅ FIXED: if: always() ensures callback ALWAYS fires
-      # ═══════════════════════════════════════════
       - name: Notify Backend (Success)
         if: env.BUILD_SUCCESS == 'true'
         run: |
