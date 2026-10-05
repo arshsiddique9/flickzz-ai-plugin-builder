@@ -116,6 +116,16 @@ jobs:
           echo "✅ Found JAR: $JAR_FILE"
           echo "JAR_PATH=$JAR_FILE" >> $GITHUB_ENV
 
+      # 🆕 VERIFIER AGENT STEP
+      - name: Verify Built JAR (Verifier Agent)
+        if: success()
+        run: |
+          cd plugin-src
+          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" | head -1)
+          cd ..
+          node -e "require('./scripts/verifier').verifyJar('./plugin-src/' + '$JAR_FILE'.replace('./', ''))"
+          echo "✅ Verifier Agent passed!"
+
       - name: Upload JAR to Supabase
         if: success()
         run: |
