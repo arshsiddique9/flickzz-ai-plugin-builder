@@ -1,6 +1,6 @@
 // scripts/providers.js
 
-const { getFixerPrompt } = require('./agents'); // 🆕 Import agent
+const { getFixerPrompt } = require('./agents');
 
 const PROVIDERS = [
     { name: "OpenRouter-Qwen", url: "https://openrouter.ai/api/v1/chat/completions", model: "qwen/qwen-2.5-coder-32b-instruct", apiKeyEnv: "OPENROUTER_API_KEY", maxTokens: 4096 },
@@ -16,8 +16,8 @@ async function executeProviderCall(provider, prompt) {
     let body = { model: provider.model, max_tokens: provider.maxTokens, messages: [{ role: "user", content: prompt }] };
 
     if (provider.name.includes("Anthropic")) {
-        headers["x-api-key"] = apiKey; 
-        headers["anthropic-version"] = "2023-06-01"; 
+        headers["x-api-key"] = apiKey;
+        headers["anthropic-version"] = "2023-06-01";
         delete headers["Authorization"];
     }
 
@@ -30,18 +30,17 @@ async function executeProviderCall(provider, prompt) {
 }
 
 /**
- * Main fix function with Context and Error Log
+ * Fix code with context and error log (standard repair flow)
  */
 async function fixCodeWithProviders(code, fileName, projectContext = "", errorLog = "", plan = "") {
-    const MAX_SIZE_FOR_AI = 50000; 
+    const MAX_SIZE_FOR_AI = 50000;
     let contentToSend = code, isPreview = false;
-    
+
     if (code.length > MAX_SIZE_FOR_AI) {
-        contentToSend = code.substring(0, MAX_SIZE_FOR_AI) + "\n\n... [TRUNCATED] ..."; 
+        contentToSend = code.substring(0, MAX_SIZE_FOR_AI) + "\n\n... [TRUNCATED] ...";
         isPreview = true;
     }
 
-    // Use the Fixer Agent's prompt structure
     const prompt = getFixerPrompt(projectContext, errorLog, fileName, contentToSend, plan);
 
     for (const provider of PROVIDERS) {
@@ -56,4 +55,23 @@ async function fixCodeWithProviders(code, fileName, projectContext = "", errorLo
     return { success: false, fixedCode: code, provider: null };
 }
 
-module.exports = { fixCodeWithProviders, PROVIDERS };
+/**
+ * 🆕 RAW CODE GENERATOR
+ * Direct prompt bhejta hai bina fixer wrapper ke. Ye missing file generation ke liye hai.
+ */
+async function generateRawCode(prompt) {
+    for (const provider of PROVIDERS) {
+        try {
+            console.log(`[Raw Gen] Trying ${provider.name}...`);
+            const code = await executeProviderCall(provider, prompt);
+            if (code && code.length > 20) {
+                return { success: true, code, provider: provider.name };
+            }
+        } catch (error) {
+            console.error(`[Raw Gen Fail] ${provider.name}: ${error.message}`);
+        }
+    }
+    return { success: false, code: null, provider: null };
+}
+
+module.exports = { fixCodeWithProviders, generateRawCode, PROVIDERS };
