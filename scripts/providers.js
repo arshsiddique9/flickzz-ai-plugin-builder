@@ -1,236 +1,151 @@
-// ============================================
-// FlickZZ Provider Stack — Multi-Tier Fallback
-// 8 Providers · Auto-Health · Auto-Fallback
-// ============================================
+// providers.js
 
-// Environment keys
-const KEYS = {
-    dahl: process.env.DAHL_API_KEY,
-    nara: process.env.NARA_API_KEY,
-    openrouter: process.env.OPENROUTER_API_KEY,
-    agentrouter: process.env.AGENTROUTER_API_KEY,
-    unorouter: process.env.UNOROUTER_API_KEY,
-    tokenharbor: process.env.TOKENHARBOR_API_KEY,
-    nvidia: process.env.NVIDIA_API_KEY,
-    openapis: 'admin', // Free beta
-};
+/**
+ * Agentic AI Providers Module
+ * Prioritizes robust error handling, large file previews, and exact failure logging.
+ */
 
-// ═══════════════════════════════════════════
-// TIER 1: Premium Quality (Best for coding)
-// ═══════════════════════════════════════════
-const TIER_1 = [
+const PROVIDERS = [
     {
-        name: 'OpenAPIs-Claude',
-        url: 'https://api.openapis.online/anthropic/v1/chat/completions',
-        key: KEYS.openapis,
-        model: 'claude-opus-4.7',
-        tier: 1,
-        strength: 'coding',
-        timeout: 90000
+        name: "OpenRouter-Qwen",
+        url: "https://openrouter.ai/api/v1/chat/completions",
+        model: "qwen/qwen-2.5-coder-32b-instruct", // FIXED: Updated to active Qwen model
+        apiKeyEnv: "OPENROUTER_API_KEY",
+        maxTokens: 4096,
     },
     {
-        name: 'OpenAPIs-GPT',
-        url: 'https://api.openapis.online/openai/v1/chat/completions',
-        key: KEYS.openapis,
-        model: 'gpt-5.5',
-        tier: 1,
-        strength: 'reasoning',
-        timeout: 90000
+        name: "OpenAI-GPT4o",
+        url: "https://api.openai.com/v1/chat/completions",
+        model: "gpt-4o",
+        apiKeyEnv: "OPENAI_API_KEY",
+        maxTokens: 4096,
     },
     {
-        name: 'AgentRouter-Claude',
-        url: 'https://agentrouter.org/v1/chat/completions',
-        key: KEYS.agentrouter,
-        model: 'claude-opus-4-8',
-        tier: 1,
-        strength: 'coding',
-        extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ' },
-        timeout: 90000
-    },
-    {
-        name: 'AgentRouter-GPT6',
-        url: 'https://agentrouter.org/v1/chat/completions',
-        key: KEYS.agentrouter,
-        model: 'gpt-6-astra',
-        tier: 1,
-        strength: 'reasoning',
-        extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ' },
-        timeout: 90000
+        name: "Anthropic-Claude",
+        url: "https://api.anthropic.com/v1/messages",
+        model: "claude-3-5-sonnet-20240620",
+        apiKeyEnv: "ANTHROPIC_API_KEY",
+        maxTokens: 4096,
     }
+    // REMOVED: TokenHarbor (Broken URL / Deprecated API)
 ];
 
-// ═══════════════════════════════════════════
-// TIER 2: Fast & Reliable (Best for planning)
-// ═══════════════════════════════════════════
-const TIER_2 = [
-    {
-        name: 'NVIDIA-DeepSeek',
-        url: 'https://integrate.api.nvidia.com/v1/chat/completions',
-        key: KEYS.nvidia,
-        model: 'deepseek-ai/deepseek-r1',
-        tier: 2,
-        strength: 'coding',
-        timeout: 90000
-    },
-    {
-        name: 'NVIDIA-Qwen',
-        url: 'https://integrate.api.nvidia.com/v1/chat/completions',
-        key: KEYS.nvidia,
-        model: 'qwen/qwen2.5-coder-32b-instruct',
-        tier: 2,
-        strength: 'coding',
-        timeout: 90000
-    },
-    {
-        name: 'Dahl-MiniMax',
-        url: 'https://inference.dahl.global/v1/chat/completions',
-        key: KEYS.dahl,
-        model: 'MiniMaxAI/MiniMax-M2.7',
-        tier: 2,
-        strength: 'balanced',
-        timeout: 90000
-    },
-    {
-        name: 'Dahl-DeepSeek',
-        url: 'https://inference.dahl.global/v1/chat/completions',
-        key: KEYS.dahl,
-        model: 'deepseek-ai/DeepSeek-V4-Flash-0731',
-        tier: 2,
-        strength: 'coding',
-        timeout: 90000
-    },
-    {
-        name: 'Nara-Super',
-        url: 'https://router.bynara.id/v1/chat/completions',
-        key: KEYS.nara,
-        model: 'nemotron-3-super-free',
-        tier: 2,
-        strength: 'balanced',
-        timeout: 90000
+/**
+ * Helper to construct the AI prompt based on file size and context
+ */
+function buildPrompt(code, fileName, isPreview) {
+    let prompt = `You are an expert AI coding assistant. Your task is to fix the code in the file: ${fileName}.\n`;
+    
+    if (isPreview) {
+        prompt += `NOTE: This is a PREVIEW of a large file. Analyze the provided snippet and suggest precise patches or fixes. Do not attempt to rewrite the entire file from scratch.\n`;
+    } else {
+        prompt += `Please provide the fully corrected code. Output ONLY the code without markdown formatting or explanations.\n`;
     }
-];
 
-// ═══════════════════════════════════════════
-// TIER 3: Fallback (When others fail)
-// ═══════════════════════════════════════════
-const TIER_3 = [
-    {
-        name: 'Nara-Ultra',
-        url: 'https://router.bynara.id/v1/chat/completions',
-        key: KEYS.nara,
-        model: 'nemotron-3-ultra-free',
-        tier: 3,
-        strength: 'balanced',
-        timeout: 90000
-    },
-    {
-        name: 'OpenRouter-Qwen',
-        url: 'https://openrouter.ai/api/v1/chat/completions',
-        key: KEYS.openrouter,
-        model: 'qwen/qwen3-coder:free',
-        tier: 3,
-        strength: 'coding',
-        extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ' },
-        timeout: 90000
-    },
-    {
-        name: 'OpenRouter-Nemotron',
-        url: 'https://openrouter.ai/api/v1/chat/completions',
-        key: KEYS.openrouter,
-        model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
-        tier: 3,
-        strength: 'balanced',
-        extra: { 'HTTP-Referer': 'https://flickzz.qzz.io', 'X-Title': 'FlickZZ' },
-        timeout: 90000
-    },
-    {
-        name: 'UNOROUTER',
-        url: 'https://api.unorouter.com/v1/chat/completions',
-        key: KEYS.unorouter,
-        model: 'nemotron-3-ultra-550b-a55b:free',
-        tier: 3,
-        strength: 'balanced',
-        timeout: 90000
-    },
-    {
-        name: 'TokenHarbor',
-        url: 'https://api.tokenharbor.ai/v1/chat/completions',
-        key: KEYS.tokenharbor,
-        model: 'deepseek-v4.1-flash:free',
-        tier: 3,
-        strength: 'coding',
-        timeout: 90000
+    prompt += `\n--- CODE START ---\n${code}\n--- CODE END ---\n`;
+    return prompt;
+}
+
+/**
+ * Executes the API call for a specific provider
+ */
+async function executeProviderCall(provider, prompt) {
+    const apiKey = process.env[provider.apiKeyEnv];
+    if (!apiKey) {
+        throw new Error(`API Key missing for environment variable: ${provider.apiKeyEnv}`);
     }
-];
 
-// ═══════════════════════════════════════════
-// HEALTH TRACKING (in-memory for this run)
-// ═══════════════════════════════════════════
-const health = {};
+    const headers = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+    };
 
-function recordSuccess(name) {
-    if (!health[name]) health[name] = { fail: 0, success: 0 };
-    health[name].success++;
-    health[name].fail = Math.max(0, health[name].fail - 1);
-}
+    let body = {};
 
-function recordFailure(name) {
-    if (!health[name]) health[name] = { fail: 0, success: 0 };
-    health[name].fail++;
-}
+    // Configure body based on provider
+    if (provider.name.includes("Anthropic")) {
+        headers["x-api-key"] = apiKey;
+        headers["anthropic-version"] = "2023-06-01";
+        delete headers["Authorization"];
+        body = {
+            model: provider.model,
+            max_tokens: provider.maxTokens,
+            messages: [{ role: "user", content: prompt }]
+        };
+    } else {
+        // OpenAI and OpenRouter compatible format
+        body = {
+            model: provider.model,
+            max_tokens: provider.maxTokens,
+            messages: [{ role: "user", content: prompt }]
+        };
+    }
 
-function isHealthy(name) {
-    const h = health[name];
-    if (!h) return true;
-    return (h.success - h.fail) > -3;
-}
-
-// ═══════════════════════════════════════════
-// GET PROVIDERS BY TIER
-// ═══════════════════════════════════════════
-function getProviders(options = {}) {
-    const { tier, strength, priority } = options;
-
-    let all = [...TIER_1, ...TIER_2, ...TIER_3];
-
-    // Filter by tier if specified
-    if (tier) all = all.filter(p => p.tier === tier);
-
-    // Filter by strength if specified
-    if (strength) all = all.filter(p => p.strength === strength);
-
-    // Filter out keys that are missing
-    all = all.filter(p => p.key);
-
-    // Sort: healthy first, then by tier
-    all.sort((a, b) => {
-        const aH = isHealthy(a.name) ? 1 : 0;
-        const bH = isHealthy(b.name) ? 1 : 0;
-        if (aH !== bH) return bH - aH;
-        return a.tier - b.tier;
+    const response = await fetch(provider.url, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(body)
     });
 
-    return all;
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HTTP ${response.status} - ${response.statusText}. Details: ${errorText}`);
+    }
+
+    const data = await response.json();
+    
+    // Extract content based on provider response structure
+    let content = "";
+    if (provider.name.includes("Anthropic")) {
+        content = data.content[0].text;
+    } else {
+        content = data.choices[0].message.content;
+    }
+
+    // Clean up markdown block if AI ignored instructions
+    return content.replace(/```[a-z]*\n/g, '').replace(/```/g, '').trim();
 }
 
-// ═══════════════════════════════════════════
-// COUNT PROVIDERS
-// ═══════════════════════════════════════════
-function getProviderStats() {
-    return {
-        total: TIER_1.length + TIER_2.length + TIER_3.length,
-        tier1: TIER_1.filter(p => p.key).length,
-        tier2: TIER_2.filter(p => p.key).length,
-        tier3: TIER_3.filter(p => p.key).length,
-        activeKeys: Object.values(KEYS).filter(k => k && k !== 'admin').length
-    };
+/**
+ * Main function to fix code using the first available working provider
+ */
+async function fixCodeWithProviders(code, fileName) {
+    // 1. Agentic Behavior: Handle Large Files
+    const MAX_SIZE_FOR_AI = 50000; // 50KB
+    let contentToSend = code;
+    let isPreview = false;
+
+    if (code.length > MAX_SIZE_FOR_AI) {
+        contentToSend = code.substring(0, MAX_SIZE_FOR_AI) + "\n\n... [TRUNCATED FOR AI PREVIEW] ...";
+        isPreview = true;
+        console.log(`[Agentic] Large file detected (${code.length} bytes). Sending preview to AI.`);
+    }
+
+    const prompt = buildPrompt(contentToSend, fileName, isPreview);
+
+    // 2. Iterate through providers (Fallback mechanism)
+    for (const provider of PROVIDERS) {
+        try {
+            console.log(`[Agentic] Attempting fix using provider: ${provider.name}...`);
+            const fixedCode = await executeProviderCall(provider, prompt);
+            
+            if (fixedCode) {
+                console.log(`[Success] Provider ${provider.name} successfully processed ${fileName}.`);
+                return { success: true, fixedCode, provider: provider.name };
+            }
+        } catch (error) {
+            // Phase 3 requirement: Log the EXACT reason for provider failure
+            console.error(`[Provider Failure] ${provider.name} failed for ${fileName}.`);
+            console.error(`[Exact Reason] ${error.message}`);
+            
+            // Continue to next provider in the loop
+            console.log(`[Fallback] Switching to next provider...`);
+        }
+    }
+
+    // If all providers fail
+    console.error(`[Critical] All AI providers failed to fix ${fileName}.`);
+    return { success: false, fixedCode: code, provider: null };
 }
 
-module.exports = {
-    getProviders,
-    getProviderStats,
-    recordSuccess,
-    recordFailure,
-    isHealthy,
-    KEYS
-};
+module.exports = { fixCodeWithProviders, PROVIDERS };
