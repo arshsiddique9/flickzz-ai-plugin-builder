@@ -48,7 +48,6 @@ jobs:
           fi
           unzip -q source.zip && rm source.zip
           echo "✅ Source extracted"
-          find . -type f | head -30
 
       - name: Build Project Context
         run: |
@@ -80,19 +79,17 @@ jobs:
             fi
 
             echo "❌ Build failed on attempt $attempt"
-            tail -30 build.log
 
             if [ $attempt -eq 3 ]; then
               echo "❌ Max attempts reached."
               break
             fi
 
-            echo ""
             echo "🤖 Triggering Agentic AI Auto-Fix..."
             
-            # Run the new orchestrator from root, passing the build.log
+            # Run the new orchestrator from root, passing build.log AND project-context.json
             cd ..
-            node index.js ./plugin-src ./plugin-src/build.log
+            node index.js ./plugin-src ./plugin-src/build.log ./plugin-src/project-context.json
             FIX_EXIT=$?
             cd plugin-src
 
