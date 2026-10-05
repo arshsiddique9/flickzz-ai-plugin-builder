@@ -3,183 +3,227 @@
 const fs = require('fs');
 const path = require('path');
 const { trimAfterClass, fixBraces } = require('./auto-fix');
-const { fixCodeWithProviders } = require('./providers');
+const { fixCodeWithProviders, PROVIDERS } = require('./providers');
 const { parseErrorLog } = require('./parse-error');
 
-/**
- * 🆕 UPGRADED VERIFIER
- * Sirf brace count nahi, actual Java structure bhi check karta hai.
- */
 function verifyCode(code, fileName = '') {
-    if (!code || code.trim().length === 0) {
-        return { valid: false, reason: "Code is empty" };
-    }
-
-    // 1. Brace balance check
+    if (!code || code.trim().length === 0) return { valid: false, reason: "Code is empty" };
     let openBraces = 0, closeBraces = 0;
     for (let char of code) {
         if (char === '{') openBraces++;
         if (char === '}') closeBraces++;
     }
-    if (openBraces !== closeBraces) {
-        return { valid: false, reason: `Unbalanced braces. Open: ${openBraces}, Close: ${closeBraces}` };
+    if (openBraces !== closeBraces) return { valid: false, reason: `Unbalanced braces` };
+    if (fileName.endsWith('.java')) {
+        if (!/\b(class|interface|enum|record)\s+\w+/.test(code)) {
+            return { valid: false, reason: "No class declaration found" };
+        }
+        if (!code.trim().endsWith('}')) {
+            return { valid: false, reason: "File does not end with closing brace" };
+        }
+    }
+    return { valid: true, reason: "OK" };
+}
+
+function fileHasError(fileName, extractedErrors) {
+    if (!extractedErrors) return false;
+    return extractedErrors.toLowerCase().includes(path.basename(fileName).toLowerCase());
+}
+
+/**
+ * 🆕 MISSING FILE GENERATOR
+ * Build error log mein "cannot find symbol class X" aur "package X does not exist" dekhta hai
+ * aur AI se missing files generate karwa ke correct path pe save karta hai.
+ */
+async function generateMissingFiles(dirPath, extractedErrors, projectContext, srcRoot) {
+    if (!extractedErrors) return false;
+
+    // Step 1: Missing classes extract karo ("symbol: class X")
+    const missingClasses = new Set();
+    const classRegex = /symbol:\s+class\s+([A-Z]\w+)/g;
+    let match;
+    while ((match = classRegex.exec(extractedErrors)) !== null) {
+        missingClasses.add(match[1]);
     }
 
-    // 2. 🆕 Java-specific checks (agar .java file hai)
-    if (fileName.endsWith('.java')) {
-        // Check karo ki file mein kam se kam ek class/interface/enum ho
-        const hasClassDecl = /\b(class|interface|enum|record)\s+\w+/.test(code);
-        if (!hasClassDecl) {
-            return { valid: false, reason: "No class/interface/enum/record declaration found" };
-        }
+    // Step 2: Missing packages extract karo ("package X.Y.Z does not exist")
+    const missingPackages = new Set();
+    const pkgRegex = /package\s+([\w\.]+)\s+does not exist/g;
+    while ((match = pkgRegex.exec(extractedErrors)) !== null) {
+        missingPackages.add(match[1]);
+    }
 
-        // Check karo ki class ke bahar extra content toh nahi hai
-        // Simplified: Last non-whitespace character must be `}` 
-        const trimmed = code.trim();
-        if (!trimmed.endsWith('}')) {
-            return { valid: false, reason: "File does not end with closing brace (extra content after class?)" };
-        }
+    // Step 3: Jodi missing imports ka mapping nikaalo (konsi class kis package mein chahiye)
+    // Existing source files scan karke imports dekhlo
+    const importsMap = {}; // className -> full package path
 
-        // 🆕 Check: Koi bhi line jo class ke bahar ho (heuristic)
-        // Count karo kitni baar 'class X {' aur matching '}' hai
-        // Simplified heuristic: agar file mein "class " ke baad kuch random text hai, detect karo
-        const lines = code.split('\n');
-        let classDepth = 0;
-        let foundClassEnd = false;
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            // Agar class khatam ho gayi aur uske baad koi non-empty, non-comment line hai
-            if (foundClassEnd && line.trim().length > 0 && 
-                !line.trim().startsWith('//') && 
-                !line.trim().startsWith('/*') &&
-                !line.trim().startsWith('*')) {
-                return { valid: false, reason: `Extra content detected after class (line ${i + 1}): ${line.trim().substring(0, 50)}` };
+    function scanImports(dir) {
+        if (!fs.existsSync(dir)) return;
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                scanImports(fullPath);
+            } else if (entry.name.endsWith('.java')) {
+                const content = fs.readFileSync(fullPath, 'utf8');
+                for (const cls of missingClasses) {
+                    const regex = new RegExp(`import\\s+([\\w\\.]+)\\.${cls};`, 'g');
+                    const m = regex.exec(content);
+                    if (m) importsMap[cls] = m[1];
+                }
             }
         }
     }
+    scanImports(srcRoot);
 
-    // 3. 🆕 General check: File mein koi obvious garbage nahi hona chahiye
-    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(code)) {
-        return { valid: false, reason: "File contains invalid control characters" };
+    if (missingClasses.size === 0) {
+        console.log(`[MissingFiles] No missing classes detected.`);
+        return false;
     }
 
-    return { valid: true, reason: "Code looks structurally valid" };
+    console.log(`[MissingFiles] 🔍 Detected ${missingClasses.size} missing classes: ${[...missingClasses].join(', ')}`);
+
+    // Step 4: Har missing class ke liye AI se file generate karwao
+    for (const className of missingClasses) {
+        const pkg = importsMap[className] || [...missingPackages][0] || 'com.flickzz.generated.managers';
+        const pkgPath = pkg.split('.').join('/');
+        const filePath = path.join(srcRoot, pkgPath, `${className}.java`);
+
+        // Skip if file already exists (don't overwrite)
+        if (fs.existsSync(filePath)) {
+            console.log(`[MissingFiles] ⏭️ ${className}.java already exists, skipping.`);
+            continue;
+        }
+
+        console.log(`[MissingFiles] 🤖 Generating missing file: ${pkg}.${className}...`);
+
+        const prompt = `You are an expert Minecraft Bukkit/Paper plugin developer.
+Generate a complete Java class file for a Minecraft plugin.
+
+REQUIREMENTS:
+- Class name: ${className}
+- Package: ${pkg}
+- File path will be: ${pkgPath}/${className}.java
+- Target: PaperMC 1.21.1, Java 21
+- This class is referenced by other files but missing. Analyze the imports of the project and guess its purpose from its name.
+
+PROJECT CONTEXT:
+${projectContext ? projectContext.substring(0, 2000) : 'N/A'}
+
+CRITICAL RULES:
+1. Include proper package declaration: package ${pkg};
+2. Include all necessary imports (org.bukkit.*, java.util.*, etc.)
+3. Provide complete implementation with common methods (singleton getInstance() if it's a manager, proper fields, constructor)
+4. Output ONLY the Java code, no markdown, no explanations.
+5. Do NOT include any content after the final closing brace.
+
+Now generate the complete ${className}.java file:`;
+
+        try {
+            // Direct provider call (skip the standard fixCodeWithProviders because we want raw generation)
+            const result = await fixCodeWithProviders('// New file to generate', `${className}.java`, '', prompt, '');
+            if (!result.success || !result.fixedCode) {
+                console.warn(`[MissingFiles] ⚠️ Failed to generate ${className}.java`);
+                continue;
+            }
+
+            let generatedCode = result.fixedCode;
+
+            // Ensure package declaration exists
+            if (!generatedCode.includes('package ')) {
+                generatedCode = `package ${pkg};\n\n${generatedCode}`;
+            }
+
+            // Verify
+            const verify = verifyCode(generatedCode, `${className}.java`);
+            if (!verify.valid) {
+                console.warn(`[MissingFiles] ⚠️ Generated ${className}.java invalid: ${verify.reason}`);
+                continue;
+            }
+
+            // Ensure folder exists
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, generatedCode, 'utf8');
+            console.log(`[MissingFiles] ✅ Created: ${filePath} (${generatedCode.length} chars)`);
+
+        } catch (err) {
+            console.error(`[MissingFiles] ❌ Error generating ${className}: ${err.message}`);
+        }
+    }
+
+    return true;
 }
 
-/**
- * 🆕 Check karo ki current file ka error build log mein hai ya nahi
- */
-function fileHasError(fileName, extractedErrors) {
-    if (!extractedErrors) return false;
-    // Bas file ka naam check karo (case-insensitive)
-    const baseName = path.basename(fileName);
-    return extractedErrors.toLowerCase().includes(baseName.toLowerCase());
-}
-
-/**
- * Process a single file
- */
 async function processFile(filePath, projectContext = "", extractedErrors = "", depContext = "") {
     const fileName = path.basename(filePath);
     console.log(`\n[Orchestrator] 🤖 Fixing: ${fileName}`);
-    
     if (!fs.existsSync(filePath)) return;
 
     let code = fs.readFileSync(filePath, 'utf8');
-
-    // 🆕 Check karo ki is file ka error hai ya nahi
     const hasError = fileHasError(fileName, extractedErrors);
-    if (hasError) {
-        console.log(`[Orchestrator] ⚠️ This file HAS errors in build log. AI will be called.`);
-    }
+    if (hasError) console.log(`[Orchestrator] ⚠️ This file HAS errors in build log. AI will be called.`);
 
-    // Step 1: Deterministic Fixes (sirf tab apply karo jab error na ho)
     if (!hasError) {
         const beforeFix = code;
         code = fixBraces(code);
         const verification = verifyCode(code, fileName);
-        
         if (verification.valid && code === beforeFix) {
-            console.log(`[Orchestrator] ✅ Deterministic check passed, no AI needed for ${fileName}.`);
+            console.log(`[Orchestrator] ✅ No issues detected for ${fileName}.`);
             return;
         }
     } else {
-        // 🆕 Agar error hai, toh deterministic fix try karo, par AI ko BHI call karo
-        console.log(`[Orchestrator] 🔧 Applying deterministic fixes first...`);
         code = fixBraces(code);
     }
 
-    // Step 2: Verify after deterministic
     let verification = verifyCode(code, fileName);
     if (verification.valid && !hasError) {
         fs.writeFileSync(filePath, code, 'utf8');
         console.log(`[Orchestrator] ✅ Deterministic fix successful for ${fileName}.`);
         return;
     }
+    if (!verification.valid) console.log(`[Orchestrator] ⚠️ Verification failed: ${verification.reason}`);
 
-    if (!verification.valid) {
-        console.log(`[Orchestrator] ⚠️ Verification failed: ${verification.reason}`);
-    }
-
-    // Step 3: AI Loop (ALWAYS run if hasError, or if verification failed)
     const MAX_RETRIES = 3;
-    let feedback = extractedErrors 
-        ? `Compiler Error Log:\n${extractedErrors}\n\nPlease fix the code based on these errors.` 
+    let feedback = extractedErrors
+        ? `Compiler Error Log:\n${extractedErrors}\n\nPlease fix the code based on these errors. IMPORTANT: Do NOT remove or modify any import statements. Keep all existing imports.`
         : "";
-    
-    if (hasError && !feedback) {
-        feedback = `This file has errors in the build log. Please review and fix any issues.`;
-    }
 
     const fullContext = projectContext + depContext;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         console.log(`[Orchestrator] 🧠 AI Attempt ${attempt}/${MAX_RETRIES} for ${fileName}...`);
-        
         const result = await fixCodeWithProviders(code, fileName, fullContext, feedback);
-
         if (!result.success) {
-            console.warn(`[Orchestrator] ⚠️ Provider returned no result, retrying...`);
             feedback = "Previous provider failed to respond. Please try again.";
             continue;
         }
 
         const aiCode = result.fixedCode;
-
-        // AI ne empty ya garbage return kiya?
         if (!aiCode || aiCode.trim().length < 10) {
-            console.warn(`[Orchestrator] ⚠️ AI returned empty/garbage code. Retrying...`);
             feedback = "Your previous response was empty or invalid. Please provide the complete fixed code.";
             continue;
         }
 
         const aiVerification = verifyCode(aiCode, fileName);
-
         if (aiVerification.valid) {
             fs.writeFileSync(filePath, aiCode, 'utf8');
-            console.log(`[Orchestrator] 🎉 AI successfully fixed ${fileName}! (${aiCode.length} chars)`);
+            console.log(`[Orchestrator] 🎉 AI successfully fixed ${fileName}!`);
             return;
         } else {
-            console.warn(`[Orchestrator] ⚠️ AI output invalid: ${aiVerification.reason}`);
-            feedback = `Your previous response had this error: ${aiVerification.reason}. Please fix it and return ONLY valid Java code.`;
-            code = aiCode; // AI ke attempt ko base banao
+            feedback = `Your previous response had this error: ${aiVerification.reason}. Please fix it.`;
+            code = aiCode;
         }
     }
 
-    console.error(`[Orchestrator] ❌ CRITICAL FAILURE for ${fileName} after ${MAX_RETRIES} AI attempts.`);
+    console.error(`[Orchestrator] ❌ FAILURE for ${fileName} after ${MAX_RETRIES} attempts.`);
     fs.writeFileSync(filePath + ".broken", code, 'utf8');
 }
 
-/**
- * Process an entire directory
- */
 async function processDirectory(dirPath, rawLogPath = "", contextPath = "", depContext = "") {
     console.log(`\n========================================`);
     console.log(`[Orchestrator] 📂 Processing Directory: ${dirPath}`);
     console.log(`========================================`);
 
-    // Skip target/ and node_modules/
     if (dirPath.includes('target') || dirPath.includes('node_modules') || dirPath.includes('.git')) {
         console.log(`[Orchestrator] ⏭️ Skipping: ${dirPath}`);
         return;
@@ -195,14 +239,19 @@ async function processDirectory(dirPath, rawLogPath = "", contextPath = "", depC
         extractedErrors = parseErrorLog(rawLogPath);
     }
 
+    // 🆕 STEP 1: Missing files generate karo (agar errors mein missing packages hain)
+    const srcRoot = path.join(dirPath, 'src', 'main', 'java');
+    if (fs.existsSync(srcRoot) && extractedErrors) {
+        await generateMissingFiles(dirPath, extractedErrors, projectContext, srcRoot);
+    }
+
+    // 🆕 STEP 2: Ab baaki files ko fix karo (import errors ab mostly solve ho jayenge)
     const files = fs.readdirSync(dirPath, { withFileTypes: true });
     for (const file of files) {
         const fullPath = path.join(dirPath, file.name);
-        
         if (file.isDirectory()) {
             await processDirectory(fullPath, rawLogPath, contextPath, depContext);
         } else if (file.name.endsWith('.java')) {
-            // 🆕 Sirf .java files pe AI call karo (pom.xml, yml skip karo)
             await processFile(fullPath, projectContext, extractedErrors, depContext);
         }
     }
