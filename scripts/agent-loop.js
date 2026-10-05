@@ -1,5 +1,5 @@
 // scripts/agent-loop.js
-// Real agentic loop with LIVE PROGRESS CALLBACKS
+// Real agentic loop with LIVE PROGRESS CALLBACKS + retry logic
 
 const { TOOL_SCHEMAS, executeTool } = require('./agent-tools');
 const { selectWorkingProvider, invalidateProvider, PROVIDERS } = require('./free-models');
@@ -8,7 +8,9 @@ const CALLBACK_URL = process.env.CALLBACK_URL || '';
 const BUILD_ID = process.env.BUILD_ID || '';
 
 async function sendProgress(payload) {
-    if (!CALLBACK_URL || !BUILD_ID) return;
+    if (!CALLBACK_URL || !BUILD_ID) {
+        return; // Silent skip if env not set
+    }
     try {
         await fetch(CALLBACK_URL, {
             method: 'POST',
@@ -16,7 +18,7 @@ async function sendProgress(payload) {
             body: JSON.stringify({ build_id: BUILD_ID, ...payload })
         });
     } catch (e) {
-        console.warn(`[Progress] Callback failed: ${e.message}`);
+        // Silent fail — don't crash agent
     }
 }
 
@@ -54,66 +56,80 @@ async function callProvider(provider, model, messages, tools) {
     const apiKey = process.env[provider.keyEnv];
     if (!apiKey) throw new Error(`Missing ${provider.keyEnv}`);
 
-    const res = await fetch(provider.url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            'HTTP-Referer': 'https://flickzz.qzz.io',
-            'X-Title': 'FlickZZ Agentic Builder'
-        },
-        body: JSON.stringify({
-            model, messages, tools,
-            tool_choice: 'auto',
-            max_tokens: 4096,
-            temperature: 0.2
-        })
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000); // 90s per call
 
-    if (!res.ok) {
-        const errText = (await res.text()).slice(0, 400);
-        const err = new Error(`HTTP ${res.status}: ${errText}`);
-        err.status = res.status;
-        err.isRateLimit = res.status === 429;
+    try {
+        const res = await fetch(provider.url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'HTTP-Referer': 'https://flickzz.qzz.io',
+                'X-Title': 'FlickZZ Agentic Builder'
+            },
+            body: JSON.stringify({
+                model, messages, tools,
+                tool_choice: 'auto',
+                max_tokens: 4096,
+                temperature: 0.2
+            }),
+            signal: controller.signal
+        });
+        clearTimeout(timer);
+
+        if (!res.ok) {
+            const errText = (await res.text()).slice(0, 400);
+            const err = new Error(`HTTP ${res.status}: ${errText}`);
+            err.status = res.status;
+            err.isRateLimit = res.status === 429;
+            throw err;
+        }
+
+        const rawText = await res.text();
+
+        if (looksLikeHtml(rawText)) {
+            const err = new Error(`Provider returned HTML (endpoint broken)`);
+            err.isHtml = true;
+            throw err;
+        }
+
+        let data;
+        try { data = JSON.parse(rawText); }
+        catch (e) { throw new Error(`Invalid JSON: ${rawText.slice(0, 200)}`); }
+
+        if (!data.choices || !data.choices[0]) {
+            throw new Error(`No choices: ${rawText.slice(0, 200)}`);
+        }
+
+        return data.choices[0].message;
+    } catch (err) {
+        clearTimeout(timer);
         throw err;
     }
-
-    const rawText = await res.text();
-
-    if (looksLikeHtml(rawText)) {
-        const err = new Error(`Provider returned HTML (endpoint broken)`);
-        err.isHtml = true;
-        throw err;
-    }
-
-    let data;
-    try { data = JSON.parse(rawText); }
-    catch (e) { throw new Error(`Invalid JSON: ${rawText.slice(0, 200)}`); }
-
-    if (!data.choices || !data.choices[0]) {
-        throw new Error(`No choices: ${rawText.slice(0, 200)}`);
-    }
-
-    return data.choices[0].message;
 }
 
 async function buildProviderQueue() {
     const queue = [];
-    const cacheFile = process.env.WORKSPACE_ROOT + '/.free-model-cache.json';
+    const cacheFile = (process.env.WORKSPACE_ROOT || '.') + '/.free-model-cache.json';
     let cache = {};
     try {
-        if (require('fs').existsSync(cacheFile)) {
-            cache = JSON.parse(require('fs').readFileSync(cacheFile, 'utf8'));
+        const fs = require('fs');
+        if (fs.existsSync(cacheFile)) {
+            cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
         }
     } catch {}
 
+    // First: cached working providers
     for (const provider of PROVIDERS) {
         if (cache[provider.id]?.model && process.env[provider.keyEnv]) {
             queue.push({ provider, model: cache[provider.id].model });
         }
     }
 
+    // Fallback: probe all
     if (queue.length === 0) {
+        console.log(`[Agent] No cached providers, probing...`);
         const { probeAll } = require('./free-models');
         const results = await probeAll();
         for (const r of results) {
@@ -150,10 +166,10 @@ async function runAgent(initialPrompt, maxSteps = 25) {
     for (let step = 1; step <= maxSteps; step++) {
         console.log(`\n━━━ STEP ${step}/${maxSteps} ━━━`);
 
-        // 🆕 LIVE PROGRESS — bhejo har step ka start
+        // 🆕 LIVE PROGRESS — step starting
         await sendProgress({
             status: 'agent_step',
-            step: step,
+            step,
             total: maxSteps,
             stage: 'thinking',
             message: `Step ${step}/${maxSteps} — thinking...`
@@ -161,7 +177,7 @@ async function runAgent(initialPrompt, maxSteps = 25) {
 
         let assistantMsg = null;
         let triedCount = 0;
-        const maxTries = providerQueue.length;
+        const maxTries = providerQueue.length * 2; // 2 full rotations
         let usedProvider = null;
 
         while (triedCount < maxTries && !assistantMsg) {
@@ -177,9 +193,17 @@ async function runAgent(initialPrompt, maxSteps = 25) {
                 if (err.isHtml || (err.message && err.message.includes('404'))) {
                     invalidateProvider(provider.id);
                 }
-                if (err.isRateLimit && triedCount === maxTries - 1) {
-                    console.log(`[Agent] ⏱️ Rate limit — waiting 30s...`);
+
+                // Rate limit → wait 30s before retry
+                if (err.isRateLimit) {
+                    console.log(`[Agent] ⏱️ Rate limited — waiting 30s...`);
                     await new Promise(r => setTimeout(r, 30000));
+                }
+
+                // Timeout → wait 5s
+                if (err.message && err.message.includes('aborted')) {
+                    console.log(`[Agent] ⏱️ Timeout — waiting 5s...`);
+                    await new Promise(r => setTimeout(r, 5000));
                 }
 
                 triedCount++;
@@ -191,7 +215,7 @@ async function runAgent(initialPrompt, maxSteps = 25) {
             await sendProgress({
                 status: 'agent_failed',
                 step,
-                error: 'All providers failed at this step'
+                error: `All providers failed at step ${step}`
             });
             return { success: false, reason: 'All providers failed' };
         }
@@ -207,11 +231,11 @@ async function runAgent(initialPrompt, maxSteps = 25) {
         }
 
         if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
-            await sendProgress({ status: 'agent_failed', step, error: 'Agent stopped' });
+            await sendProgress({ status: 'agent_failed', step, error: 'Agent stopped without tool calls' });
             return { success: false, reason: 'Agent stopped' };
         }
 
-        // 🆕 Execute tool calls with live updates
+        // Execute tool calls
         for (const tc of assistantMsg.tool_calls) {
             const toolName = tc.function.name;
             let toolArgs = {};
@@ -219,7 +243,7 @@ async function runAgent(initialPrompt, maxSteps = 25) {
 
             console.log(`[Agent] 🔧 ${toolName}(${JSON.stringify(toolArgs).slice(0, 120)})`);
 
-            // 🆕 Update before executing tool
+            // 🆕 LIVE PROGRESS — tool executing
             await sendProgress({
                 status: 'agent_step',
                 step,
@@ -227,7 +251,7 @@ async function runAgent(initialPrompt, maxSteps = 25) {
                 stage: 'executing',
                 tool: toolName,
                 model: usedProvider?.model || 'unknown',
-                message: `${toolName}(${JSON.stringify(toolArgs).slice(0, 60)})`
+                message: `${toolName}: ${JSON.stringify(toolArgs).slice(0, 80)}`
             });
 
             const result = executeTool(toolName, toolArgs);
@@ -256,6 +280,7 @@ async function runAgent(initialPrompt, maxSteps = 25) {
             });
         }
 
+        // Context window management
         if (messages.length > 32) {
             const sys = messages[0];
             const recent = messages.slice(-30);
