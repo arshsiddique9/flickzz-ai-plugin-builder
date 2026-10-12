@@ -49,15 +49,12 @@ console.log(`🔄 Max Steps: ${maxSteps}`);
 console.log(`📄 Log: ${logPath || 'not provided'}`);
 console.log(`📋 Context: ${contextPath || 'not provided'}`);
 console.log(`🔑 Available keys: ${[
+    'APINEX_API_KEY', // 🆕 Added
     'OPENROUTER_API_KEY', 'NVIDIA_API_KEY', 'AGENTROUTER_API_KEY',
     'TOKENHARBOR_API_KEY', 'UNOROUTER_API_KEY', 'DAHL_API_KEY', 'NARA_API_KEY'
 ].filter(k => process.env[k]).join(', ')}\n`);
 
 async function main() {
-    // ═══════════════════════════════════════════
-    // PRE-PASS: Deterministic fixes + missing files
-    // (Runs BEFORE agent, so agent sees cleaner code)
-    // ═══════════════════════════════════════════
     console.log(`\n${'═'.repeat(60)}`);
     console.log(`🔧 PRE-PASS — orchestrator cleaning`);
     console.log(`${'═'.repeat(60)}\n`);
@@ -71,9 +68,6 @@ async function main() {
         console.warn(`   Continuing to agent anyway...\n`);
     }
 
-    // ═══════════════════════════════════════════
-    // MAIN PASS: Agent
-    // ═══════════════════════════════════════════
     const prompt = `Fix the Maven build in the workspace.
 
 START by running:
