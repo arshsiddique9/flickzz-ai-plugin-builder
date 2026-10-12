@@ -2,16 +2,9 @@
 
 const { getFixerPrompt } = require('./agents');
 
-// 🎯 SMART ROUTING: DeepSeek for complex fixes, GPT-6 Luna for fast ones
+// 🎯 SMART ROUTING: GPT-6 Luna (fast) aur DeepSeek V4.1 Flash (stable)
 const PROVIDERS = [
-    // 🆕 APINEX - Primary Provider (Best Coding Models)
-    { 
-        name: "APINEX-DeepSeek", 
-        url: "https://api.apinex.bond/v1/chat/completions", 
-        model: "free/deepseek-v4-pro", 
-        apiKeyEnv: "APINEX_API_KEY", 
-        maxTokens: 8192 
-    },
+    // 🆕 APINEX - Primary Provider (Best Working Models)
     { 
         name: "APINEX-GPT6", 
         url: "https://api.apinex.bond/v1/chat/completions", 
@@ -19,10 +12,16 @@ const PROVIDERS = [
         apiKeyEnv: "APINEX_API_KEY", 
         maxTokens: 8192 
     },
-    // 🛡️ Fallback Providers (Keep as backup)
-    { name: "OpenRouter-Qwen", url: "https://openrouter.ai/api/v1/chat/completions", model: "qwen/qwen-2.5-coder-32b-instruct", apiKeyEnv: "OPENROUTER_API_KEY", maxTokens: 4096 },
-    { name: "UNOROUTER", url: "https://api.unorouter.com/v1/chat/completions", model: "gemini-3.5-flash-lite:free", apiKeyEnv: "UNOROUTER_API_KEY", maxTokens: 4096 },
-    { name: "TokenHarbor", url: "https://api.tokenharbor.ai/v1/chat/completions", model: "qwen3.8-flash:free", apiKeyEnv: "TOKENHARBOR_API_KEY", maxTokens: 4096 }
+    { 
+        name: "APINEX-DeepSeek", 
+        url: "https://api.apinex.bond/v1/chat/completions", 
+        model: "free/deepseek-v4.1-flash", 
+        apiKeyEnv: "APINEX_API_KEY", 
+        maxTokens: 8192 
+    },
+    // 🛡️ Fallback Providers
+    { name: "Dahl", url: "https://inference.dahl.global/v1/chat/completions", model: "MiniMaxAI/MiniMax-M2.7", apiKeyEnv: "DAHL_API_KEY", maxTokens: 4096 },
+    { name: "OpenRouter-Qwen", url: "https://openrouter.ai/api/v1/chat/completions", model: "qwen/qwen-2.5-coder-32b-instruct", apiKeyEnv: "OPENROUTER_API_KEY", maxTokens: 4096 }
 ];
 
 async function executeProviderCall(provider, prompt) {
@@ -40,9 +39,6 @@ async function executeProviderCall(provider, prompt) {
     return content.replace(/```[a-z]*\n/g, '').replace(/```/g, '').trim();
 }
 
-/**
- * Fix code with context and error log (standard repair flow)
- */
 async function fixCodeWithProviders(code, fileName, projectContext = "", errorLog = "", plan = "") {
     const MAX_SIZE_FOR_AI = 50000;
     let contentToSend = code, isPreview = false;
@@ -66,9 +62,6 @@ async function fixCodeWithProviders(code, fileName, projectContext = "", errorLo
     return { success: false, fixedCode: code, provider: null };
 }
 
-/**
- * 🆕 RAW CODE GENERATOR (For Missing Files)
- */
 async function generateRawCode(prompt) {
     for (const provider of PROVIDERS) {
         try {
