@@ -21,6 +21,8 @@ jobs:
       UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
       TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
       NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      # 🆕 Naya Provider Add Karo
+      APINEX_API_KEY: ${{ secrets.APINEX_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
