@@ -3,6 +3,7 @@
 /**
  * PLANNER AGENT PROMPT
  * Yeh AI ko project ka pura structure aur context deta hai.
+ * 🎯 Model Suggestion: Gemini 3.5 Flash / Qwen 3.8 (Fast planning)
  */
 function getPlannerPrompt(projectContext, errorLog, fileName) {
     return `
@@ -25,6 +26,7 @@ Based on the above, explain briefly what the root cause of the error might be an
 /**
  * CODER/FIXER AGENT PROMPT
  * Yeh AI se exact code fix karwata hai.
+ * 🎯 Model Suggestion: DeepSeek V4 Pro (Complex coding) / GPT-6 Luna (Fast fixing)
  */
 function getFixerPrompt(projectContext, errorLog, fileName, currentCode, plan = "") {
     return `
