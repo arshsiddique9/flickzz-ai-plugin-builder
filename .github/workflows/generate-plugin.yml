@@ -55,6 +55,8 @@ jobs:
           DAHL_API_KEY: ${{ secrets.DAHL_API_KEY }}
           NARA_API_KEY: ${{ secrets.NARA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # 🆕 Naya Provider Add Karo
+          APINEX_API_KEY: ${{ secrets.APINEX_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           JOB_ID: ${{ github.event.inputs.job_id }}
