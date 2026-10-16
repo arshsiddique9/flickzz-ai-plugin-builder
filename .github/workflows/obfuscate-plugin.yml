@@ -55,12 +55,10 @@ jobs:
       - name: Install & Run ProGuard
         run: |
           cd obf_workspace
-          # Download ProGuard
           wget -q https://github.com/Guardsquare/proguard/releases/download/v7.4.2/proguard-7.4.2.tar.gz
           tar -xzf proguard-7.4.2.tar.gz
           mv proguard-7.4.2 proguard
 
-          # Create basic ProGuard config
           cat > proguard.pro << 'EOF'
           -injars input.jar
           -outjars output.jar
@@ -99,12 +97,31 @@ jobs:
             -H "x-upsert: true" \
             --data-binary "@output.jar"
 
-          # Update job status
           curl -X PATCH "$SUPABASE_URL/rest/v1/obfuscate_jobs?id=eq.$JOB_ID" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
             -d "{\"status\":\"success\",\"artifact_path\":\"$ARTIFACT_PATH\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+      # 🆕 Source file turant delete karo (storage clean rakhne ke liye)
+      - name: Delete Source File (Immediate Cleanup)
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          SOURCE_PATH=$(curl -s -X GET "$SUPABASE_URL/rest/v1/obfuscate_jobs?id=eq.$JOB_ID&select=source_path" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" | jq -r '.[0].source_path')
+
+          if [ -n "$SOURCE_PATH" ] && [ "$SOURCE_PATH" != "null" ]; then
+            echo "Deleting source: $SOURCE_PATH"
+            curl -s -X DELETE "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/$SOURCE_PATH" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY"
+            echo "✅ Source deleted"
+          fi
 
       - name: Mark Failed (On Error)
         if: failure()
