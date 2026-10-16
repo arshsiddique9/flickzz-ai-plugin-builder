@@ -1,0 +1,120 @@
+name: Obfuscate Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+
+jobs:
+  obfuscate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch Job & Download Source
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          JOB_DATA=$(curl -s -X GET "$SUPABASE_URL/rest/v1/obfuscate_jobs?id=eq.$JOB_ID&select=*" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY")
+
+          SOURCE_PATH=$(echo "$JOB_DATA" | jq -r '.[0].source_path')
+          if [ -z "$SOURCE_PATH" ] || [ "$SOURCE_PATH" = "null" ]; then
+            echo "Job not found or missing source_path"
+            exit 1
+          fi
+
+          mkdir -p obf_workspace
+          cd obf_workspace
+          DOWNLOAD_URL="$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/$SOURCE_PATH"
+          curl -s -L -o input.jar \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            "$DOWNLOAD_URL"
+          echo "Source JAR downloaded: $(du -h input.jar | cut -f1)"
+
+      - name: Install & Run ProGuard
+        run: |
+          cd obf_workspace
+          # Download ProGuard
+          wget -q https://github.com/Guardsquare/proguard/releases/download/v7.4.2/proguard-7.4.2.tar.gz
+          tar -xzf proguard-7.4.2.tar.gz
+          mv proguard-7.4.2 proguard
+
+          # Create basic ProGuard config
+          cat > proguard.pro << 'EOF'
+          -injars input.jar
+          -outjars output.jar
+          -dontwarn
+          -dontoptimize
+          -dontpreverify
+          -keepattributes *Annotation*, Signature, Exception
+          -keep public class * extends org.bukkit.plugin.java.JavaPlugin {
+              public <init>();
+          }
+          -keep class plugin.yml
+          -keep class config.yml
+          -keepclassmembers class * {
+              @org.bukkit.event.EventHandler <methods>;
+          }
+          -repackageclasses 'a'
+          -flattenpackagehierarchy ''
+          EOF
+
+          java -jar proguard/lib/proguard.jar @proguard.pro
+          echo "Obfuscation complete: $(du -h output.jar | cut -f1)"
+
+      - name: Upload Obfuscated JAR to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          cd obf_workspace
+          ARTIFACT_PATH="obf_artifacts/${JOB_ID}.jar"
+
+          curl -X POST "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/$ARTIFACT_PATH" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/java-archive" \
+            -H "x-upsert: true" \
+            --data-binary "@output.jar"
+
+          # Update job status
+          curl -X PATCH "$SUPABASE_URL/rest/v1/obfuscate_jobs?id=eq.$JOB_ID" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"success\",\"artifact_path\":\"$ARTIFACT_PATH\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+      - name: Mark Failed (On Error)
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          curl -X PATCH "$SUPABASE_URL/rest/v1/obfuscate_jobs?id=eq.$JOB_ID" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"failed\",\"error\":\"Obfuscation process failed in GitHub Actions\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
