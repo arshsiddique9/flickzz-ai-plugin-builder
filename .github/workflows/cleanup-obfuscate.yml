@@ -1,0 +1,60 @@
+name: Cleanup Obfuscation Files
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Cleanup Old Files
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          CUTOFF=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+          echo "Cleaning up jobs older than: $CUTOFF"
+
+          JOBS=$(curl -s -X GET "$SUPABASE_URL/rest/v1/obfuscate_jobs?completed_at=lt.$CUTOFF&select=id,source_path,artifact_path" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY")
+
+          COUNT=$(echo "$JOBS" | jq 'length')
+          echo "Found $COUNT old job(s) to clean"
+
+          if [ "$COUNT" = "0" ]; then
+            echo "✅ Nothing to clean"
+            exit 0
+          fi
+
+          echo "$JOBS" | jq -c '.[]' | while read job; do
+            ID=$(echo $job | jq -r '.id')
+            SOURCE=$(echo $job | jq -r '.source_path // empty')
+            ARTIFACT=$(echo $job | jq -r '.artifact_path // empty')
+
+            echo "Cleaning job: $ID"
+
+            if [ -n "$SOURCE" ] && [ "$SOURCE" != "null" ]; then
+              curl -s -X DELETE "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/$SOURCE" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+                -H "apikey: $SUPABASE_SERVICE_KEY"
+            fi
+
+            if [ -n "$ARTIFACT" ] && [ "$ARTIFACT" != "null" ]; then
+              curl -s -X DELETE "$SUPABASE_URL/storage/v1/object/flickzz-builder-artifacts/$ARTIFACT" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+                -H "apikey: $SUPABASE_SERVICE_KEY"
+            fi
+
+            curl -s -X DELETE "$SUPABASE_URL/rest/v1/obfuscate_jobs?id=eq.$ID" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY"
+
+            echo "✅ Cleaned: $ID"
+          done
+
+          echo "✅ Cleanup complete"
